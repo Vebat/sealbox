@@ -15,13 +15,22 @@ import (
 	"github.com/Vebat/sealbox/internal/store"
 )
 
-// fakeVault keeps plaintext in a map. The real store is tested against
-// Postgres in internal/store; here only the HTTP layer is under test.
-type fakeVault struct{ objects map[string][]byte }
+// fakeVault keeps plaintext and normalized index values in memory. The real
+// store is tested against Postgres in internal/store; here only the HTTP
+// layer is under test.
+type fakeVault struct {
+	objects map[string][]byte
+	indexed map[string]map[string]string
+}
 
-func (f *fakeVault) Put(_ context.Context, collection string, plaintext []byte) (string, error) {
+func newFakeVault() *fakeVault {
+	return &fakeVault{objects: map[string][]byte{}, indexed: map[string]map[string]string{}}
+}
+
+func (f *fakeVault) Put(_ context.Context, collection string, plaintext []byte, indexed map[string]string) (string, error) {
 	id := "tok_" + strconv.Itoa(len(f.objects)+1)
 	f.objects[collection+"/"+id] = plaintext
+	f.indexed[collection+"/"+id] = indexed
 	return id, nil
 }
 
@@ -39,7 +48,18 @@ func (f *fakeVault) Delete(_ context.Context, collection, id string) error {
 		return store.ErrNotFound
 	}
 	delete(f.objects, k)
+	delete(f.indexed, k)
 	return nil
+}
+
+func (f *fakeVault) Search(_ context.Context, collection, field, normalized string) ([]string, error) {
+	var ids []string
+	for k, idx := range f.indexed {
+		if c, id, _ := strings.Cut(k, "/"); c == collection && idx[field] == normalized {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
 
 const (
@@ -52,12 +72,12 @@ const (
 var testClients = []Client{
 	{Name: "admin", Key: adminKey, Roles: AllRoles},
 	{Name: "checkout", Key: writerKey, Roles: []string{RoleWrite}},
-	{Name: "support", Key: supportKey, Roles: []string{RoleReadMasked}},
+	{Name: "support", Key: supportKey, Roles: []string{RoleReadMasked, RoleSearch}},
 	{Name: "privacy", Key: privacyKey, Roles: []string{RoleReadFull, RoleDelete}},
 }
 
 const testSchema = `{"customers": {"fields": {
-	"email":    {"type": "email"},
+	"email":    {"type": "email", "index": true},
 	"card":     {"type": "card"},
 	"passport": {"type": "string"}
 }}}`
@@ -71,7 +91,7 @@ func newServer(t *testing.T) *httptest.Server {
 	if err := ValidateClients(testClients); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(New(&fakeVault{objects: map[string][]byte{}}, s, testClients))
+	srv := httptest.NewServer(New(newFakeVault(), s, testClients))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -141,6 +161,50 @@ func TestLifecycle(t *testing.T) {
 	}
 }
 
+func TestSearch(t *testing.T) {
+	srv := newServer(t)
+	a := strings.TrimPrefix(create(t, srv, "customers", `{"email":"Ivan@Example.com"}`), "/v1/collections/customers/objects/")
+	b := strings.TrimPrefix(create(t, srv, "customers", `{"email":"ivan@example.com"}`), "/v1/collections/customers/objects/")
+	create(t, srv, "customers", `{"email":"other@example.com"}`)
+
+	const path = "/v1/collections/customers/search"
+	status, body := do(t, srv, "POST", path, `{"email":" IVAN@example.com"}`, supportKey)
+	if status != http.StatusOK {
+		t.Fatalf("search: %d %s", status, body)
+	}
+	var got struct {
+		IDs []string `json:"ids"`
+	}
+	json.Unmarshal([]byte(body), &got)
+	if len(got.IDs) != 2 || !strings.Contains(body, a) || !strings.Contains(body, b) {
+		t.Fatalf("search: expected %s and %s, got %s", a, b, body)
+	}
+
+	if _, body := do(t, srv, "POST", path, `{"email":"nobody@example.com"}`, supportKey); body != `{"ids":[]}` {
+		t.Errorf("no match: got %s", body)
+	}
+
+	for name, tc := range map[string]struct {
+		path, body string
+		want       int
+	}{
+		"not indexed":           {path, `{"passport":"4510 123456"}`, http.StatusBadRequest},
+		"unknown field":         {path, `{"ssn":"123"}`, http.StatusBadRequest},
+		"two fields":            {path, `{"email":"a@b","passport":"x"}`, http.StatusBadRequest},
+		"non-string value":      {path, `{"email":5}`, http.StatusBadRequest},
+		"not an object":         {path, `["email"]`, http.StatusBadRequest},
+		"undeclared collection": {"/v1/collections/logs/search", `{"email":"a@b"}`, http.StatusBadRequest},
+	} {
+		status, body := do(t, srv, "POST", tc.path, tc.body, supportKey)
+		if status != tc.want {
+			t.Errorf("%s: expected %d, got %d %s", name, tc.want, status, body)
+		}
+		if strings.Contains(body, "4510") || strings.Contains(body, "123") {
+			t.Errorf("%s: response echoes submitted data: %s", name, body)
+		}
+	}
+}
+
 func TestRoles(t *testing.T) {
 	srv := newServer(t)
 	const object = `{"email":"ivan@example.com"}`
@@ -154,16 +218,19 @@ func TestRoles(t *testing.T) {
 		{"checkout", writerKey, "GET", path, http.StatusForbidden},
 		{"checkout", writerKey, "GET", path + "?reveal=full", http.StatusForbidden},
 		{"checkout", writerKey, "DELETE", path, http.StatusForbidden},
+		{"checkout", writerKey, "POST", "/v1/collections/customers/search", http.StatusForbidden},
 
 		{"support", supportKey, "POST", "/v1/collections/customers/objects", http.StatusForbidden},
 		{"support", supportKey, "GET", path, http.StatusOK},
 		{"support", supportKey, "GET", path + "?reveal=full", http.StatusForbidden},
 		{"support", supportKey, "DELETE", path, http.StatusForbidden},
+		{"support", supportKey, "POST", "/v1/collections/customers/search", http.StatusOK},
 		// Role is checked before existence: no 404 oracle for the unprivileged.
 		{"support", supportKey, "GET", "/v1/collections/customers/objects/tok_nope?reveal=full", http.StatusForbidden},
 
 		{"privacy", privacyKey, "POST", "/v1/collections/customers/objects", http.StatusForbidden},
 		{"privacy", privacyKey, "GET", path, http.StatusForbidden},
+		{"privacy", privacyKey, "POST", "/v1/collections/customers/search", http.StatusForbidden},
 		{"privacy", privacyKey, "GET", path + "?reveal=full", http.StatusOK},
 		{"privacy", privacyKey, "DELETE", path, http.StatusNoContent},
 	} {

@@ -107,3 +107,24 @@ func TestBadMasterKeySize(t *testing.T) {
 		t.Fatal("expected error for 16-byte master key")
 	}
 }
+
+func TestBlindIndex(t *testing.T) {
+	e := newEnvelope(t)
+	h := e.BlindIndex("customers", "email", "ivan@example.com")
+	if len(h) != 32 {
+		t.Fatalf("hash length %d", len(h))
+	}
+	if !bytes.Equal(h, e.BlindIndex("customers", "email", "ivan@example.com")) {
+		t.Fatal("same input must hash the same")
+	}
+	for name, other := range map[string][]byte{
+		"other value":      e.BlindIndex("customers", "email", "ivan@example.org"),
+		"other field":      e.BlindIndex("customers", "phone", "ivan@example.com"),
+		"other collection": e.BlindIndex("employees", "email", "ivan@example.com"),
+		"other master key": newEnvelope(t).BlindIndex("customers", "email", "ivan@example.com"),
+	} {
+		if bytes.Equal(h, other) {
+			t.Errorf("%s: hash must differ", name)
+		}
+	}
+}

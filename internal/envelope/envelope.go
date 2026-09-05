@@ -9,7 +9,10 @@ package envelope
 
 import (
 	"crypto/cipher"
+	"crypto/hkdf"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -35,7 +38,8 @@ type Sealed struct {
 
 // Envelope seals and opens values under one master key.
 type Envelope struct {
-	kek cipher.AEAD
+	kek      cipher.AEAD
+	indexKey []byte
 }
 
 // New returns an Envelope for a 32-byte master key.
@@ -44,7 +48,27 @@ func New(masterKey []byte) (*Envelope, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Envelope{kek: kek}, nil
+	// A separate key for the blind index, so index hashes and ciphertext
+	// never share key material even though both descend from the master key.
+	indexKey, err := hkdf.Key(sha256.New, masterKey, nil, "sealbox/blind-index/v1", KeySize)
+	if err != nil {
+		return nil, err
+	}
+	return &Envelope{kek: kek, indexKey: indexKey}, nil
+}
+
+// BlindIndex returns a keyed hash of a normalized value for exact-match
+// lookup. Without the master key a database dump cannot be used to test
+// guesses. collection and field are part of the input, so the same value in
+// two fields yields two unrelated hashes.
+func (e *Envelope) BlindIndex(collection, field, normalized string) []byte {
+	m := hmac.New(sha256.New, e.indexKey)
+	m.Write([]byte(collection))
+	m.Write([]byte{0})
+	m.Write([]byte(field))
+	m.Write([]byte{0})
+	m.Write([]byte(normalized))
+	return m.Sum(nil)
 }
 
 // Seal encrypts plaintext under a fresh DEK. aad is authenticated but not

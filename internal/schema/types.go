@@ -12,16 +12,22 @@ const hidden = "***"
 type fieldType struct {
 	validate func(string) error
 	mask     func(string) string
+	// normalize maps every spelling of the same value to one form, so the
+	// blind index matches "Ivan@Example.com " and "ivan@example.com". Types
+	// without a normal form cannot be indexed.
+	normalize func(string) string
 }
 
 // types are the declarable field types. Masks are fixed per type: a mask that
 // can be configured is a mask that can be misconfigured.
 var types = map[string]fieldType{
 	"string": {validate: func(string) error { return nil }, mask: func(string) string { return hidden }},
-	"email":  {validate: validateEmail, mask: maskEmail},
-	"phone":  {validate: validatePhone, mask: maskPhone},
-	"card":   {validate: validateCard, mask: maskCard},
+	"email":  {validate: validateEmail, mask: maskEmail, normalize: normalizeEmail},
+	"phone":  {validate: validatePhone, mask: maskPhone, normalize: digits},
+	"card":   {validate: validateCard, mask: maskCard, normalize: digits},
 }
+
+func normalizeEmail(v string) string { return strings.ToLower(strings.TrimSpace(v)) }
 
 func validateEmail(v string) error {
 	local, domain, ok := strings.Cut(v, "@")

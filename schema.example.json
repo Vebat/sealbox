@@ -1,8 +1,8 @@
 {
   "customers": {
     "fields": {
-      "email":    { "type": "email" },
-      "phone":    { "type": "phone" },
+      "email":    { "type": "email", "index": true },
+      "phone":    { "type": "phone", "index": true },
       "card":     { "type": "card" },
       "passport": { "type": "string" }
     }

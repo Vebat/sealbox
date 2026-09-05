@@ -29,6 +29,7 @@ Keys belong to named clients with explicit roles, declared in `SEALBOX_KEYS_FILE
 | `read_masked` | `GET` with masks applied |
 | `read_full` | `GET ?reveal=full`, the plaintext |
 | `delete` | `DELETE`, the crypto-shred |
+| `search` | `POST .../search`, ids by an indexed value |
 
 A checkout service gets `write`. A support UI gets `read_masked`. Only the privacy tooling gets `read_full` and `delete`.
 Role is checked before the object is looked up, so an unprivileged key learns nothing about what exists.
@@ -46,15 +47,15 @@ GET /v1/collections/customers/objects/tok_9f3a...?reveal=full
 
 DELETE /v1/collections/customers/objects/tok_9f3a...
 -> 204, the object's key is destroyed; its ciphertext is now noise
-```
 
-Planned, not built yet:
-
-```http
 POST /v1/collections/customers/search
-{ "email": "ivan@example.com" }
--> { "ids": ["tok_9f3a..."] }
+{ "email": "Ivan@Example.com" }
+-> 200 { "ids": ["tok_9f3a..."] }
 ```
+
+Search takes exactly one indexed field and finds objects whose value is equal after normalization.
+It is exact match only: you can find a record by a value you already know in full, you cannot browse.
+Ranges, prefixes and free text belong in your own database, on fields that are not personal data.
 
 ## Schemas
 
@@ -62,27 +63,29 @@ A schema file, passed as `SEALBOX_SCHEMA`, declares what each collection holds. 
 
 ```json
 { "customers": { "fields": {
-    "email":    { "type": "email" },
-    "phone":    { "type": "phone" },
+    "email":    { "type": "email", "index": true },
+    "phone":    { "type": "phone", "index": true },
     "card":     { "type": "card" },
     "passport": { "type": "string" }
 } } }
 ```
 
-| Type | Accepts | Masked as |
-|---|---|---|
-| `string` | anything | `***` |
-| `email` | `local@domain` | `i***@example.com` |
-| `phone` | 7 to 15 digits, with `+ - ( ) .` and spaces | `***4567` |
-| `card` | 13 to 19 digits passing Luhn, with `-` and spaces | `**** **** **** 1234` |
+| Type | Accepts | Masked as | Normalized for search as |
+|---|---|---|---|
+| `string` | anything | `***` | cannot be indexed |
+| `email` | `local@domain` | `i***@example.com` | trimmed, lower case |
+| `phone` | 7 to 15 digits, with `+ - ( ) .` and spaces | `***4567` | digits only |
+| `card` | 13 to 19 digits passing Luhn, with `-` and spaces | `**** **** **** 1234` | digits only |
 
 Rules:
 
 - In a declared collection every value must be a string of the declared type; unknown fields are rejected. Fields are optional.
 - A collection missing from the schema is free-form: any JSON object is accepted, and a masked read hides every value as `***`.
-- Masks are fixed per type. What they keep, the email domain and the last four digits, is visible to every holder of the API key by design.
+- Masks are fixed per type. What they keep, the email domain and the last four digits, is visible to every holder of a `read_masked` key by design.
+- `index: true` makes a field searchable. sealbox stores an HMAC-SHA256 of the normalized value under a key derived from the master key, never the value.
+  A database dump shows which records share a value, not what it is, and cannot be used to test guesses without the master key.
 - Validation errors name the field, never the submitted value.
-- The schema is read at startup. Change the file, restart the process.
+- The schema is read at startup. Change the file, restart the process. Adding `index` to a field indexes new objects only; re-indexing existing ones is not built yet.
 
 ## Transport
 
@@ -150,7 +153,7 @@ Each item is one release.
 - [x] HTTP API: create, get, delete; one API key; TLS built in, plaintext only on loopback
 - [x] Collection schemas from a JSON file; email, phone, card and string types; masked reads by default
 - [x] API keys per client with roles: write, delete, read_masked, read_full
-- [ ] Blind index for exact-match search on email and phone
+- [x] Blind index: exact-match search on indexed email, phone and card fields, own `search` role
 - [ ] Append-only audit log of every reveal
 - [ ] Batch import and batch reveal
 - [ ] OpenAPI spec and a generated client

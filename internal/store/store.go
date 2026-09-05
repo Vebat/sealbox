@@ -79,21 +79,50 @@ func (s *Store) Close() { s.pool.Close() }
 // Ping reports whether the database is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-// Put seals plaintext under a fresh key and stores it. The returned id is the
-// token the caller keeps instead of the data.
-func (s *Store) Put(ctx context.Context, collection string, plaintext []byte) (string, error) {
+// Put seals plaintext under a fresh key and stores it, together with a
+// blind-index entry for every indexed field (field name to normalized value).
+// The returned id is the token the caller keeps instead of the data.
+func (s *Store) Put(ctx context.Context, collection string, plaintext []byte, indexed map[string]string) (string, error) {
 	id := newID()
 	sealed, err := s.env.Seal(plaintext, aad(collection, id))
 	if err != nil {
 		return "", err
 	}
-	_, err = s.pool.Exec(ctx,
-		`INSERT INTO objects (id, collection, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4)`,
-		id, collection, sealed.WrappedDEK, sealed.Ciphertext)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO objects (id, collection, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4)`,
+		id, collection, sealed.WrappedDEK, sealed.Ciphertext); err != nil {
+		return "", err
+	}
+	for field, value := range indexed {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO blind_index (collection, field, hash, object_id) VALUES ($1, $2, $3, $4)`,
+			collection, field, s.env.BlindIndex(collection, field, value), id); err != nil {
+			return "", err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
 	return id, nil
+}
+
+// Search returns the ids of live objects whose indexed field equals the
+// normalized value. Only the keyed hash reaches the database.
+func (s *Store) Search(ctx context.Context, collection, field, normalized string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT object_id FROM blind_index
+		 WHERE collection = $1 AND field = $2 AND hash = $3
+		 ORDER BY object_id LIMIT 100`,
+		collection, field, s.env.BlindIndex(collection, field, normalized))
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }
 
 // Get returns the plaintext of a live object.
@@ -112,10 +141,16 @@ func (s *Store) Get(ctx context.Context, collection, id string) ([]byte, error) 
 	return s.env.Open(sealed, aad(collection, id))
 }
 
-// Delete shreds the object: its wrapped key is destroyed and the row is marked
-// deleted. The ciphertext stays but can never be opened again.
+// Delete shreds the object: its wrapped key is destroyed, the row is marked
+// deleted, and its index entries go away so a search no longer finds it.
+// The ciphertext stays but can never be opened again.
 func (s *Store) Delete(ctx context.Context, collection, id string) error {
-	tag, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx,
 		`UPDATE objects SET wrapped_dek = NULL, deleted_at = now()
 		 WHERE id = $1 AND collection = $2 AND deleted_at IS NULL`,
 		id, collection)
@@ -125,7 +160,11 @@ func (s *Store) Delete(ctx context.Context, collection, id string) error {
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM blind_index WHERE collection = $1 AND object_id = $2`, collection, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // aad binds a ciphertext to its row so it cannot be moved to another id or

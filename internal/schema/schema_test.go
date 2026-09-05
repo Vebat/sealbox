@@ -9,8 +9,8 @@ import (
 
 const example = `{
   "customers": {"fields": {
-    "email":    {"type": "email"},
-    "phone":    {"type": "phone"},
+    "email":    {"type": "email", "index": true},
+    "phone":    {"type": "phone", "index": true},
     "card":     {"type": "card"},
     "passport": {"type": "string"}
   }}
@@ -40,9 +40,10 @@ func TestParse(t *testing.T) {
 		t.Fatalf("parsed: %+v", s)
 	}
 	for name, doc := range map[string]string{
-		"unknown type": `{"c": {"fields": {"x": {"type": "ssn"}}}}`,
-		"unknown key":  `{"c": {"fields": {"x": {"type": "string", "mask": "x"}}}}`,
-		"not json":     `nope`,
+		"unknown type":    `{"c": {"fields": {"x": {"type": "ssn"}}}}`,
+		"unknown key":     `{"c": {"fields": {"x": {"type": "string", "mask": "x"}}}}`,
+		"index on string": `{"c": {"fields": {"x": {"type": "string", "index": true}}}}`,
+		"not json":        `nope`,
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
 			t.Errorf("%s: expected error", name)
@@ -119,6 +120,40 @@ func TestMaskHidesEverythingElse(t *testing.T) {
 		if v != hidden {
 			t.Errorf("%s: got %q", k, v)
 		}
+	}
+}
+
+func TestIndexed(t *testing.T) {
+	s := mustParse(t, example)
+	got := s.Indexed("customers", obj(t, `{"email":" Ivan@Example.COM ","phone":"+7 (921) 123-45-67","card":"4111 1111 1111 1111","passport":"x"}`))
+	want := map[string]string{"email": "ivan@example.com", "phone": "79211234567"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if got := s.Indexed("customers", obj(t, `{"passport":"x"}`)); got != nil {
+		t.Fatalf("no indexed fields present: got %v", got)
+	}
+	if got := s.Indexed("logs", obj(t, `{"email":"a@b"}`)); got != nil {
+		t.Fatalf("undeclared collection: got %v", got)
+	}
+}
+
+func TestNormalize(t *testing.T) {
+	s := mustParse(t, example)
+	if v, err := s.Normalize("customers", "email", "IVAN@example.com"); err != nil || v != "ivan@example.com" {
+		t.Fatalf("got %q, %v", v, err)
+	}
+	for name, field := range map[string]string{
+		"not indexed": "card",
+		"unknown":     "ssn",
+	} {
+		v, err := s.Normalize("customers", field, "secret-value")
+		if err == nil || v != "" || strings.Contains(err.Error(), "secret-value") {
+			t.Errorf("%s: got %q, %v", name, v, err)
+		}
+	}
+	if _, err := s.Normalize("logs", "email", "a@b"); err == nil {
+		t.Error("undeclared collection: expected error")
 	}
 }
 

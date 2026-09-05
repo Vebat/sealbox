@@ -19,9 +19,12 @@ type Collection struct {
 	Fields map[string]Field `json:"fields"`
 }
 
-// Field is one declared field. Type is one of the names in types.
+// Field is one declared field. Type is one of the names in types. Index
+// enables exact-match search on the field; only types with a normal form
+// (email, phone, card) can be indexed.
 type Field struct {
-	Type string `json:"type"`
+	Type  string `json:"type"`
+	Index bool   `json:"index"`
 }
 
 // Load reads a schema file. An empty path yields an empty schema.
@@ -46,12 +49,48 @@ func Parse(data []byte) (Schema, error) {
 	}
 	for cname, c := range s {
 		for fname, f := range c.Fields {
-			if _, ok := types[f.Type]; !ok {
+			t, ok := types[f.Type]
+			if !ok {
 				return nil, fmt.Errorf("schema: %s.%s: unknown type %q", cname, fname, f.Type)
+			}
+			if f.Index && t.normalize == nil {
+				return nil, fmt.Errorf("schema: %s.%s: type %q cannot be indexed", cname, fname, f.Type)
 			}
 		}
 	}
 	return s, nil
+}
+
+// Indexed returns the normalized values of the object's indexed fields, keyed
+// by field name, ready for the blind index. The object must have passed
+// Validate.
+func (s Schema) Indexed(collection string, object map[string]json.RawMessage) map[string]string {
+	var out map[string]string
+	for name, f := range s[collection].Fields {
+		raw, present := object[name]
+		if !f.Index || !present {
+			continue
+		}
+		var v string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[name] = types[f.Type].normalize(v)
+	}
+	return out
+}
+
+// Normalize prepares a search value for an indexed field. The error names
+// the field, never the value.
+func (s Schema) Normalize(collection, field, value string) (string, error) {
+	f, ok := s[collection].Fields[field]
+	if !ok || !f.Index {
+		return "", fmt.Errorf("field %q is not indexed", field)
+	}
+	return types[f.Type].normalize(value), nil
 }
 
 // Validate checks an object against its collection's declaration. Error

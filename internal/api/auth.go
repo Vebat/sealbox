@@ -20,10 +20,11 @@ const (
 	RoleDelete     = "delete"      // shred objects
 	RoleReadMasked = "read_masked" // read with masks applied
 	RoleReadFull   = "read_full"   // read plaintext
+	RoleSearch     = "search"      // look up ids by an indexed value
 )
 
 // AllRoles is every role, for the development key.
-var AllRoles = []string{RoleWrite, RoleDelete, RoleReadMasked, RoleReadFull}
+var AllRoles = []string{RoleWrite, RoleDelete, RoleReadMasked, RoleReadFull, RoleSearch}
 
 const minKeyLen = 16
 

@@ -20,15 +20,20 @@ import (
 )
 
 // maxBody caps one object. Large blobs belong in object storage, not here.
-const maxBody = 1 << 20
+// maxQuery caps a search body: one field, one value.
+const (
+	maxBody  = 1 << 20
+	maxQuery = 4096
+)
 
 var collectionRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // Vault is what the API needs from storage. *store.Store satisfies it.
 type Vault interface {
-	Put(ctx context.Context, collection string, plaintext []byte) (string, error)
+	Put(ctx context.Context, collection string, plaintext []byte, indexed map[string]string) (string, error)
 	Get(ctx context.Context, collection, id string) ([]byte, error)
 	Delete(ctx context.Context, collection, id string) error
+	Search(ctx context.Context, collection, field, normalized string) ([]string, error)
 }
 
 // New returns the /v1 handler. clients must have passed ValidateClients.
@@ -38,6 +43,7 @@ func New(v Vault, s schema.Schema, clients []Client) http.Handler {
 	mux.HandleFunc("POST /v1/collections/{collection}/objects", srv.create)
 	mux.HandleFunc("GET /v1/collections/{collection}/objects/{id}", srv.get)
 	mux.HandleFunc("DELETE /v1/collections/{collection}/objects/{id}", srv.delete)
+	mux.HandleFunc("POST /v1/collections/{collection}/search", srv.search)
 	return requireKey(clients, mux)
 }
 
@@ -74,12 +80,47 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	id, err := s.vault.Put(r.Context(), collection, body)
+	id, err := s.vault.Put(r.Context(), collection, body, s.schema.Indexed(collection, obj))
 	if err != nil {
 		internalError(w, "put", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+// search answers {"ids": [...]} for a body of exactly one indexed field and
+// its value. It confirms whether a known value exists, so it has its own role.
+func (s *server) search(w http.ResponseWriter, r *http.Request) {
+	if !require(w, r, RoleSearch) {
+		return
+	}
+	collection := r.PathValue("collection")
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxQuery))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "cannot read body")
+		return
+	}
+	var query map[string]string
+	if err := json.Unmarshal(body, &query); err != nil || len(query) != 1 {
+		writeError(w, http.StatusBadRequest, "body must be a JSON object with exactly one string field")
+		return
+	}
+	for field, value := range query {
+		normalized, err := s.schema.Normalize(collection, field, value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		ids, err := s.vault.Search(r.Context(), collection, field, normalized)
+		if err != nil {
+			internalError(w, "search", err)
+			return
+		}
+		if ids == nil {
+			ids = []string{}
+		}
+		writeJSON(w, http.StatusOK, map[string][]string{"ids": ids})
+	}
 }
 
 func (s *server) get(w http.ResponseWriter, r *http.Request) {

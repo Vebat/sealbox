@@ -6,13 +6,14 @@ import (
 	"crypto/rand"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/Vebat/sealbox/internal/envelope"
 )
 
 // Tests need a real Postgres. Set SEALBOX_TEST_DATABASE_URL to run them;
-// they are skipped otherwise.
+// they are skipped otherwise, except in CI where they must run.
 func newStore(t *testing.T) *Store {
 	t.Helper()
 	url := os.Getenv("SEALBOX_TEST_DATABASE_URL")
@@ -36,9 +37,9 @@ func newStore(t *testing.T) *Store {
 	return s
 }
 
-func mustPut(t *testing.T, s *Store, collection, plaintext string) string {
+func mustPut(t *testing.T, s *Store, collection, plaintext string, indexed map[string]string) string {
 	t.Helper()
-	id, err := s.Put(context.Background(), collection, []byte(plaintext))
+	id, err := s.Put(context.Background(), collection, []byte(plaintext), indexed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +49,7 @@ func mustPut(t *testing.T, s *Store, collection, plaintext string) string {
 func TestPutGetDelete(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
-	id := mustPut(t, s, "customers", `{"passport":"4510 123456"}`)
+	id := mustPut(t, s, "customers", `{"passport":"4510 123456"}`, nil)
 
 	got, err := s.Get(ctx, "customers", id)
 	if err != nil {
@@ -74,7 +75,7 @@ func TestDeleteShredsCiphertext(t *testing.T) {
 	// so the ciphertext is dead even for code that ignores deleted_at.
 	ctx := context.Background()
 	s := newStore(t)
-	id := mustPut(t, s, "customers", "secret")
+	id := mustPut(t, s, "customers", "secret", nil)
 	if err := s.Delete(ctx, "customers", id); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestCiphertextBoundToRow(t *testing.T) {
 	// Someone with SQL access moves a ciphertext to another id. It must not open there.
 	ctx := context.Background()
 	s := newStore(t)
-	id := mustPut(t, s, "customers", "secret")
+	id := mustPut(t, s, "customers", "secret", nil)
 	moved := newID()
 	if _, err := s.pool.Exec(ctx, `UPDATE objects SET id = $2 WHERE id = $1`, id, moved); err != nil {
 		t.Fatal(err)
@@ -114,7 +115,7 @@ func TestCiphertextBoundToRow(t *testing.T) {
 func TestCollectionIsolation(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
-	id := mustPut(t, s, "customers", "secret")
+	id := mustPut(t, s, "customers", "secret", nil)
 	if _, err := s.Get(ctx, "employees", id); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get from other collection: expected ErrNotFound, got %v", err)
 	}
@@ -130,5 +131,55 @@ func TestGetUnknown(t *testing.T) {
 	s := newStore(t)
 	if _, err := s.Get(context.Background(), "customers", "tok_nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestSearch(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	// Values arrive normalized; the caller (schema) owns normalization. Each
+	// test run uses a fresh master key, so its hashes never collide with
+	// leftovers from earlier runs in the same database.
+	ivan := map[string]string{"email": "ivan@example.com"}
+	a := mustPut(t, s, "customers", `{"email":"Ivan@Example.com"}`, ivan)
+	b := mustPut(t, s, "customers", `{"email":"ivan@example.com"}`, ivan)
+	mustPut(t, s, "customers", `{"email":"other@example.com"}`, map[string]string{"email": "other@example.com"})
+
+	search := func(collection, field, value string) []string {
+		t.Helper()
+		ids, err := s.Search(ctx, collection, field, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	if ids := search("customers", "email", "ivan@example.com"); len(ids) != 2 || !slices.Contains(ids, a) || !slices.Contains(ids, b) {
+		t.Fatalf("expected %s and %s, got %v", a, b, ids)
+	}
+	if ids := search("customers", "email", "nobody@example.com"); len(ids) != 0 {
+		t.Fatalf("unknown value: got %v", ids)
+	}
+	if ids := search("employees", "email", "ivan@example.com"); len(ids) != 0 {
+		t.Fatalf("other collection: got %v", ids)
+	}
+	if ids := search("customers", "phone", "ivan@example.com"); len(ids) != 0 {
+		t.Fatalf("other field: got %v", ids)
+	}
+
+	// The database holds a 32-byte keyed hash, never the value.
+	var stored []byte
+	if err := s.pool.QueryRow(ctx, `SELECT hash FROM blind_index WHERE object_id = $1`, a).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 32 || bytes.Contains(stored, []byte("ivan")) {
+		t.Fatalf("index row leaks the value: %q", stored)
+	}
+
+	// Shredding removes the object from the index.
+	if err := s.Delete(ctx, "customers", a); err != nil {
+		t.Fatal(err)
+	}
+	if ids := search("customers", "email", "ivan@example.com"); !slices.Equal(ids, []string{b}) {
+		t.Fatalf("after delete: expected [%s], got %v", b, ids)
 	}
 }

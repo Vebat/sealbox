@@ -37,6 +37,8 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Personal data in application logs, search indexes, analytics | The application never holds plaintext unless it explicitly reveals it. |
 | Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Planned: rate limits on full reveal, audit log. |
 | Nonce reuse | Random 24-byte nonces (XChaCha20) and a fresh key per object. |
+| Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a key derived from the master key with HKDF. Without the master key a dump cannot confirm a guess. |
+| Shredded objects still findable by search | Delete removes the object's index rows in the same transaction that destroys its key. |
 
 ## Does not protect against
 
@@ -48,6 +50,8 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Loss of the master key | Every stored value is gone. Back the key up outside the database, and test the restore. |
 | A malicious or buggy sealbox build | Verify releases. Signed builds and an SBOM are on the roadmap; a third-party audit has not happened. |
 | Traffic analysis | Object sizes and access patterns are visible to the database and the network. |
+| Equality leaking through the blind index | A dump shows which records share an indexed value, not what it is. Hashes are separated per collection and field, so the same value in two fields does not link them. Index only what you must search. |
+| Membership probing through search | Search confirms whether a value you already hold exists. It needs the `search` role; rate limits are planned. |
 | Side channels on shared hardware | Out of scope. |
 
 ## Assumptions
