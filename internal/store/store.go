@@ -35,7 +35,13 @@ var ErrNotFound = errors.New("store: object not found")
 // The blind-index key is a service key stored in the keys table.
 const indexKeyName = "blind-index"
 
-var indexKeyAAD = []byte("keys/" + indexKeyName)
+// aad binds a wrapped key and its ciphertext to their row. The prefix keeps
+// object rows and service-key rows in separate namespaces, and the NUL
+// separators keep "a"+"b\x00c" apart from "a\x00b"+"c", so nothing sealed
+// for one row can ever open as another.
+func aad(collection, id string) []byte { return []byte("objects\x00" + collection + "\x00" + id) }
+
+var indexKeyAAD = []byte("keys\x00" + indexKeyName)
 
 // Store seals values before they reach Postgres and opens them after.
 type Store struct {
@@ -125,20 +131,12 @@ type Item struct {
 	Indexed   map[string]string // field name to normalized value, for the blind index
 }
 
-// Put stores one item. See PutMany.
-func (s *Store) Put(ctx context.Context, collection string, plaintext []byte, indexed map[string]string) (string, error) {
-	ids, err := s.PutMany(ctx, collection, []Item{{Plaintext: plaintext, Indexed: indexed}})
-	if err != nil {
-		return "", err
-	}
-	return ids[0], nil
-}
-
 // PutMany seals every item under its own fresh key and stores all of them,
-// with their blind-index entries, in one transaction: all land or none do.
-// The returned ids, in item order, are the tokens callers keep instead of
-// the data.
-func (s *Store) PutMany(ctx context.Context, collection string, items []Item) ([]string, error) {
+// with their blind-index entries and one audit entry each, in one
+// transaction: all land or none do. The returned ids, in item order, are the
+// tokens callers keep instead of the data. actor names the client for the
+// audit log.
+func (s *Store) PutMany(ctx context.Context, actor, collection string, items []Item) ([]string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -163,6 +161,9 @@ func (s *Store) PutMany(ctx context.Context, collection string, items []Item) ([
 				return nil, err
 			}
 		}
+		if err := audit(ctx, tx, AuditEntry{Client: actor, Action: "create", Collection: collection, ObjectID: id}); err != nil {
+			return nil, err
+		}
 		ids = append(ids, id)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -171,22 +172,10 @@ func (s *Store) PutMany(ctx context.Context, collection string, items []Item) ([
 	return ids, nil
 }
 
-// Get returns the plaintext of one live object.
-func (s *Store) Get(ctx context.Context, collection, id string) ([]byte, error) {
-	found, err := s.GetMany(ctx, collection, []string{id})
-	if err != nil {
-		return nil, err
-	}
-	plaintext, ok := found[id]
-	if !ok {
-		return nil, ErrNotFound
-	}
-	return plaintext, nil
-}
-
 // GetMany returns the plaintext of every live object among ids, keyed by id.
 // Ids that do not exist, were deleted, or belong to another collection are
-// absent from the result.
+// absent from the result. A row that no longer opens is an error: it means
+// tampering, not absence.
 func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (map[string][]byte, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, key_id, wrapped_dek, ciphertext FROM objects
@@ -205,7 +194,7 @@ func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (m
 		}
 		plaintext, err := s.env.Open(sealed, aad(collection, id))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("object %s: %w", id, err)
 		}
 		found[id] = plaintext
 	}
@@ -213,7 +202,7 @@ func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (m
 }
 
 // Search returns the ids of live objects whose indexed field equals the
-// normalized value. Only the keyed hash reaches the database.
+// normalized value, at most 100. Only the keyed hash reaches the database.
 func (s *Store) Search(ctx context.Context, collection, field, normalized string) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT object_id FROM blind_index
@@ -227,9 +216,10 @@ func (s *Store) Search(ctx context.Context, collection, field, normalized string
 }
 
 // Delete shreds the object: its wrapped key is destroyed, the row is marked
-// deleted, and its index entries go away so a search no longer finds it.
-// The ciphertext stays but can never be opened again.
-func (s *Store) Delete(ctx context.Context, collection, id string) error {
+// deleted, its index entries go away so a search no longer finds it, and the
+// audit entry lands in the same transaction. The ciphertext stays but can
+// never be opened again.
+func (s *Store) Delete(ctx context.Context, actor, collection, id string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -247,6 +237,9 @@ func (s *Store) Delete(ctx context.Context, collection, id string) error {
 	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM blind_index WHERE collection = $1 AND object_id = $2`, collection, id); err != nil {
+		return err
+	}
+	if err := audit(ctx, tx, AuditEntry{Client: actor, Action: "delete", Collection: collection, ObjectID: id}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -271,12 +264,13 @@ func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
 	if re, changed, err := s.env.Rewrap(sealed, indexKeyAAD); err != nil {
 		return 0, 0, fmt.Errorf("blind-index key: %w", err)
 	} else if changed {
-		if _, err := s.pool.Exec(ctx,
+		tag, err := s.pool.Exec(ctx,
 			`UPDATE keys SET key_id = $1, wrapped_dek = $2 WHERE name = $3 AND key_id = $4`,
-			re.KeyID, re.WrappedDEK, indexKeyName, sealed.KeyID); err != nil {
+			re.KeyID, re.WrappedDEK, indexKeyName, sealed.KeyID)
+		if err != nil {
 			return 0, 0, err
 		}
-		rotated++
+		rotated += int(tag.RowsAffected())
 	}
 
 	type row struct {
@@ -332,11 +326,6 @@ type AuditEntry struct {
 	Field      string // search only
 }
 
-// Audit appends one entry. See AuditMany.
-func (s *Store) Audit(ctx context.Context, e AuditEntry) error {
-	return s.AuditMany(ctx, []AuditEntry{e})
-}
-
 // AuditMany appends entries as one batch in one implicit transaction. Callers
 // log a reveal before returning data, so a failed insert means no reveal.
 func (s *Store) AuditMany(ctx context.Context, entries []AuditEntry) error {
@@ -345,17 +334,20 @@ func (s *Store) AuditMany(ctx context.Context, entries []AuditEntry) error {
 	}
 	batch := &pgx.Batch{}
 	for _, e := range entries {
-		batch.Queue(
-			`INSERT INTO audit_log (client, action, collection, object_id, field)
-			 VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''))`,
-			e.Client, e.Action, e.Collection, e.ObjectID, e.Field)
+		batch.Queue(auditSQL, e.Client, e.Action, e.Collection, e.ObjectID, e.Field)
 	}
 	return s.pool.SendBatch(ctx, batch).Close()
 }
 
-// aad binds a ciphertext to its row so it cannot be moved to another id or
-// collection at the database level.
-func aad(collection, id string) []byte { return []byte(collection + "/" + id) }
+const auditSQL = `INSERT INTO audit_log (client, action, collection, object_id, field)
+	VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''))`
+
+// audit writes one entry inside a transaction, so a create or delete and
+// its log line commit together or not at all.
+func audit(ctx context.Context, tx pgx.Tx, e AuditEntry) error {
+	_, err := tx.Exec(ctx, auditSQL, e.Client, e.Action, e.Collection, e.ObjectID, e.Field)
+	return err
+}
 
 func newID() string {
 	b := make([]byte, 16)

@@ -1,5 +1,14 @@
 /sealbox
 /sealbox.exe
 /bin/
+
+# Secrets that live next to the code during development.
 .env
-/keys.json
+.env.*
+!.env.example
+keys*.json
+!keys.example.json
+*.pem
+*.key
+*.crt
+master*

@@ -10,11 +10,12 @@ func TestParseClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(clients) != 2 || clients[0].Name != "checkout" || clients[1].Name != "support" {
-		t.Fatalf("got %+v", clients)
+	byName := map[string]Client{}
+	for _, c := range clients {
+		byName[c.Name] = c
 	}
-	if !clients[1].has(RoleReadMasked) || clients[1].has(RoleReadFull) {
-		t.Fatalf("support roles: %v", clients[1].Roles)
+	if len(byName) != 2 || !byName["support"].has(RoleReadMasked) || byName["support"].has(RoleReadFull) || !byName["checkout"].has(RoleWrite) {
+		t.Fatalf("got %+v", clients)
 	}
 
 	for name, doc := range map[string]string{
@@ -28,6 +29,18 @@ func TestParseClients(t *testing.T) {
 		if _, err := ParseClients([]byte(doc)); err == nil {
 			t.Errorf("%s: expected error", name)
 		}
+	}
+}
+
+func TestValidateClientsRejectsDuplicateNames(t *testing.T) {
+	// The development key becomes a client named "default"; a keys file must
+	// not be able to shadow it, or audit rows become unattributable.
+	err := ValidateClients([]Client{
+		{Name: "default", Key: "0123456789abcdef", Roles: []string{RoleReadMasked}},
+		{Name: "default", Key: "fedcba9876543210", Roles: AllRoles},
+	})
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }
 

@@ -1,4 +1,6 @@
-# Local development only. Credentials below are throwaway.
+# Local development only. Credentials below are throwaway, and both ports are
+# bound to localhost. To start over with a fresh database and a new master
+# key: docker compose down -v
 services:
   postgres:
     image: postgres:16-alpine
@@ -6,8 +8,13 @@ services:
       POSTGRES_USER: sealbox
       POSTGRES_PASSWORD: sealbox
       POSTGRES_DB: sealbox
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "sealbox"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
 
   sealbox:
     build: .
@@ -19,8 +26,10 @@ services:
       SEALBOX_INSECURE_HTTP: "1"
       SEALBOX_SCHEMA: /etc/sealbox/schema.json
     volumes: ["./schema.example.json:/etc/sealbox/schema.json:ro"]
-    ports: ["8080:8080"]
-    depends_on: [postgres]
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   pgdata:

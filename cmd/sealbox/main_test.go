@@ -59,6 +59,13 @@ func TestLoadMasterKeys(t *testing.T) {
 		t.Fatal("two sources: expected error")
 	}
 
+	// A blank command is no source at all, not a crash.
+	clear()
+	t.Setenv("SEALBOX_MASTER_KEY_COMMAND", "   ")
+	if _, err := loadMasterKeys(); err == nil {
+		t.Fatal("blank command: expected error")
+	}
+
 	for name, value := range map[string]string{
 		"short":        "c2hvcnQ=",
 		"not base64":   "not base64!",

@@ -1,0 +1,12 @@
+# Nothing secret or irrelevant enters the build context or its cache.
+.env*
+!.env.example
+keys*.json
+!keys.example.json
+*.pem
+*.key
+*.crt
+master*
+.git
+.github
+*.md

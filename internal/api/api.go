@@ -18,7 +18,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
-	"slices"
+	"unicode/utf8"
 
 	"github.com/Vebat/sealbox/internal/schema"
 	"github.com/Vebat/sealbox/internal/store"
@@ -38,13 +38,18 @@ const (
 	maxQuery     = 4096      // a search: one field, one value
 )
 
-var collectionRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+var (
+	collectionRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+	idRe         = regexp.MustCompile(`^tok_[0-9a-f]{32}$`)
+)
 
 // Vault is what the API needs from storage. *store.Store satisfies it.
+// Creates and deletes carry the acting client so their audit entries commit
+// with the write; reveals and searches are logged through AuditMany first.
 type Vault interface {
-	PutMany(ctx context.Context, collection string, items []store.Item) ([]string, error)
+	PutMany(ctx context.Context, actor, collection string, items []store.Item) ([]string, error)
 	GetMany(ctx context.Context, collection string, ids []string) (map[string][]byte, error)
-	Delete(ctx context.Context, collection, id string) error
+	Delete(ctx context.Context, actor, collection, id string) error
 	Search(ctx context.Context, collection, field, normalized string) ([]string, error)
 	AuditMany(ctx context.Context, entries []store.AuditEntry) error
 }
@@ -95,15 +100,9 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ids, err := s.vault.PutMany(r.Context(), collection, []store.Item{item})
+	ids, err := s.vault.PutMany(r.Context(), clientFrom(r).Name, collection, []store.Item{item})
 	if err != nil {
 		internalError(w, "put", err)
-		return
-	}
-	// ponytail: create and delete are logged after the write, not inside its
-	// transaction; move the entry into the store transaction if auditors need
-	// the two to be atomic.
-	if !s.audit(w, r, "create", collection, ids[0], "") {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"id": ids[0]})
@@ -144,16 +143,9 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, item)
 	}
-	ids, err := s.vault.PutMany(r.Context(), collection, items)
+	ids, err := s.vault.PutMany(r.Context(), clientFrom(r).Name, collection, items)
 	if err != nil {
 		internalError(w, "put batch", err)
-		return
-	}
-	entries := make([]store.AuditEntry, len(ids))
-	for i, id := range ids {
-		entries[i] = store.AuditEntry{Action: "create", Collection: collection, ObjectID: id}
-	}
-	if !s.auditMany(w, r, entries) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string][]string{"ids": ids})
@@ -169,6 +161,10 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	collection, id := r.PathValue("collection"), r.PathValue("id")
+	if !idRe.MatchString(id) {
+		writeError(w, http.StatusNotFound, "object not found")
+		return
+	}
 	found, err := s.vault.GetMany(r.Context(), collection, []string{id})
 	if err != nil {
 		internalError(w, "get", err)
@@ -196,8 +192,8 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 }
 
 // revealBatch returns up to maxBatch objects in one call and logs one audit
-// entry per object returned. Ids that are unknown, deleted, or duplicated
-// are reported once under "missing" or ignored.
+// entry per object returned. Ids that are unknown or deleted are reported
+// once under "missing"; duplicates are answered once.
 func (s *server) revealBatch(w http.ResponseWriter, r *http.Request) {
 	collection := r.PathValue("collection")
 	body, ok := readBody(w, r, maxIDsBody)
@@ -230,16 +226,16 @@ func (s *server) revealBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	objects := make(map[string]any, len(found))
 	missing := []string{}
+	seen := map[string]bool{}
 	var entries []store.AuditEntry
 	for _, id := range req.IDs {
-		if _, done := objects[id]; done {
+		if seen[id] {
 			continue
 		}
+		seen[id] = true
 		plaintext, ok := found[id]
 		if !ok {
-			if !slices.Contains(missing, id) {
-				missing = append(missing, id)
-			}
+			missing = append(missing, id)
 			continue
 		}
 		rendered, err := s.render(collection, plaintext, req.Reveal == "full")
@@ -263,13 +259,17 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	collection, id := r.PathValue("collection"), r.PathValue("id")
-	err := s.vault.Delete(r.Context(), collection, id)
+	if !idRe.MatchString(id) {
+		writeError(w, http.StatusNotFound, "object not found")
+		return
+	}
+	err := s.vault.Delete(r.Context(), clientFrom(r).Name, collection, id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "object not found")
 	case err != nil:
 		internalError(w, "delete", err)
-	case s.audit(w, r, "delete", collection, id, ""):
+	default:
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -312,10 +312,15 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseObject checks that raw is a JSON object valid for the collection and
-// returns the item to store. Errors name a field, never a value.
+// returns the item to store. What is stored is the object re-encoded: keys
+// sorted, each key once, whitespace gone. A duplicate key therefore keeps
+// only the value that was validated. Errors name a field, never a value.
 func (s *server) parseObject(collection string, raw []byte) (store.Item, error) {
 	if len(raw) > maxBody {
 		return store.Item{}, errors.New("object exceeds 1 MiB")
+	}
+	if !utf8.Valid(raw) {
+		return store.Item{}, errors.New("must be valid UTF-8")
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
@@ -324,7 +329,11 @@ func (s *server) parseObject(collection string, raw []byte) (store.Item, error) 
 	if err := s.schema.Validate(collection, obj); err != nil {
 		return store.Item{}, err
 	}
-	return store.Item{Plaintext: raw, Indexed: s.schema.Indexed(collection, obj)}, nil
+	canonical, err := json.Marshal(obj)
+	if err != nil {
+		return store.Item{}, errors.New("must be a JSON object")
+	}
+	return store.Item{Plaintext: canonical, Indexed: s.schema.Indexed(collection, obj)}, nil
 }
 
 // render returns what a reader at this reveal level may see.

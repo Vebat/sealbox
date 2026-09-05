@@ -48,7 +48,7 @@ func (c *Client) Create(ctx context.Context, collection string, object any) (str
 	var res struct {
 		ID string `json:"id"`
 	}
-	err := c.do(ctx, "POST", "/v1/collections/"+collection+"/objects", object, &res)
+	err := c.do(ctx, "POST", collectionPath(collection)+"/objects", object, &res)
 	return res.ID, err
 }
 
@@ -58,14 +58,14 @@ func (c *Client) CreateBatch(ctx context.Context, collection string, objects []a
 	var res struct {
 		IDs []string `json:"ids"`
 	}
-	err := c.do(ctx, "POST", "/v1/collections/"+collection+"/objects/batch", map[string]any{"objects": objects}, &res)
+	err := c.do(ctx, "POST", collectionPath(collection)+"/objects/batch", map[string]any{"objects": objects}, &res)
 	return res.IDs, err
 }
 
 // Get decodes one object into out: masked values, or the plaintext when
 // full is true. Role: read_masked or read_full.
 func (c *Client) Get(ctx context.Context, collection, id string, full bool, out any) error {
-	path := "/v1/collections/" + collection + "/objects/" + url.PathEscape(id)
+	path := collectionPath(collection) + "/objects/" + url.PathEscape(id)
 	if full {
 		path += "?reveal=full"
 	}
@@ -83,24 +83,26 @@ func (c *Client) Reveal(ctx context.Context, collection string, ids []string, fu
 		Objects map[string]json.RawMessage `json:"objects"`
 		Missing []string                   `json:"missing"`
 	}
-	err = c.do(ctx, "POST", "/v1/collections/"+collection+"/objects/reveal", map[string]any{"ids": ids, "reveal": reveal}, &res)
+	err = c.do(ctx, "POST", collectionPath(collection)+"/objects/reveal", map[string]any{"ids": ids, "reveal": reveal}, &res)
 	return res.Objects, res.Missing, err
 }
 
 // Delete crypto-shreds one object. Role: delete.
 func (c *Client) Delete(ctx context.Context, collection, id string) error {
-	return c.do(ctx, "DELETE", "/v1/collections/"+collection+"/objects/"+url.PathEscape(id), nil, nil)
+	return c.do(ctx, "DELETE", collectionPath(collection)+"/objects/"+url.PathEscape(id), nil, nil)
 }
 
 // Search returns the ids of objects whose indexed field equals value after
-// normalization. Role: search.
+// normalization, at most 100. Role: search.
 func (c *Client) Search(ctx context.Context, collection, field, value string) ([]string, error) {
 	var res struct {
 		IDs []string `json:"ids"`
 	}
-	err := c.do(ctx, "POST", "/v1/collections/"+collection+"/search", map[string]string{field: value}, &res)
+	err := c.do(ctx, "POST", collectionPath(collection)+"/search", map[string]string{field: value}, &res)
 	return res.IDs, err
 }
+
+func collectionPath(collection string) string { return "/v1/collections/" + url.PathEscape(collection) }
 
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
 	var body io.Reader
@@ -124,16 +126,19 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return err
 	}
 	defer resp.Body.Close()
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
-		return ErrNotFound
-	case resp.StatusCode < 200 || resp.StatusCode > 299:
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		var e struct {
 			Error string `json:"error"`
 		}
 		json.NewDecoder(resp.Body).Decode(&e)
+		// Only the vault's own "object not found" is ErrNotFound. A 404 with
+		// any other body is a wrong base URL or path and stays an *Error.
+		if resp.StatusCode == http.StatusNotFound && e.Error == "object not found" {
+			return ErrNotFound
+		}
 		return &Error{Status: resp.StatusCode, Message: e.Error}
-	case out == nil:
+	}
+	if out == nil {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)

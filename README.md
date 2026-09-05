@@ -17,11 +17,12 @@ This is crypto-shredding, and it is the only practical way to honour an erasure 
 
 ## API
 
-Every request carries `Authorization: Bearer <key>`. An object is a JSON object up to 1 MiB.
+Every request carries `Authorization: Bearer <key>`. An object is a JSON object up to 1 MiB, valid UTF-8.
+It is stored re-encoded: keys sorted, each key once, last value wins, no whitespace. That is what a full read returns.
 Reads are masked unless the caller asks for `reveal=full` and holds the role for it.
 
 Keys belong to named clients with explicit roles, declared in `SEALBOX_KEYS_FILE` (see [keys.example.json](keys.example.json)).
-`SEALBOX_API_KEY` adds one client named `default` with every role, for development.
+`SEALBOX_API_KEY` adds one client named `default` with every role. It exists for development; never set it in production.
 
 | Role | Allows |
 |---|---|
@@ -53,7 +54,7 @@ POST /v1/collections/customers/search
 -> 200 { "ids": ["tok_9f3a..."] }
 ```
 
-Search takes exactly one indexed field and finds objects whose value is equal after normalization.
+Search takes exactly one indexed field and finds objects whose value is equal after normalization, at most 100 of them.
 It is exact match only: you can find a record by a value you already know in full, you cannot browse.
 Ranges, prefixes and free text belong in your own database, on fields that are not personal data.
 
@@ -123,8 +124,10 @@ Rules:
 
 - In a declared collection every value must be a string of the declared type; unknown fields are rejected. Fields are optional.
 - A collection missing from the schema is free-form: any JSON object is accepted, and a masked read hides every value as `***`.
+  Field names stay visible, so do not put personal data in the keys.
 - Masks are fixed per type. What they keep, the email domain and the last four digits, is visible to every holder of a `read_masked` key by design.
-- `index: true` makes a field searchable. sealbox stores an HMAC-SHA256 of the normalized value under a key derived from the master key, never the value.
+- `index: true` makes a field searchable. sealbox stores an HMAC-SHA256 of the normalized value, never the value, under a random
+  index key that is created on first start and kept in the `keys` table wrapped by the master key. Back that table up with the rest.
   A database dump shows which records share a value, not what it is, and cannot be used to test guesses without the master key.
 - Validation errors name the field, never the submitted value.
 - The schema is read at startup. Change the file, restart the process. Adding `index` to a field indexes new objects only; re-indexing existing ones is not built yet.
@@ -149,7 +152,9 @@ SEALBOX_MASTER_KEY_COMMAND="aws kms decrypt --ciphertext-blob fileb:///etc/sealb
 SEALBOX_MASTER_KEY_COMMAND="vault kv get -field=master secret/sealbox"
 ```
 
-The command runs without a shell. Wrap pipes in a script.
+The command runs without a shell and without sealbox's own environment variables. Wrap pipes in a script.
+The shipped image is distroless, so it has no `aws`, `vault` or shell: build your own image on top of it,
+or have an init container fetch the key into a file and use `SEALBOX_MASTER_KEY_FILE`.
 
 Losing the master key loses every object. Back it up outside the database and test the restore.
 sealbox logs the fingerprint of the current key at startup.
@@ -175,7 +180,8 @@ can still open those rows.
 
 Every successful action is written to the `audit_log` table: which client did what, to which object, when.
 For a search, the field that was queried. Never a value, never a hash.
-A reveal is logged before the data is returned: if the log cannot be written, the request fails and nothing is revealed.
+A create or delete commits together with its audit entry, in one transaction. A reveal or search is logged before the
+data is returned: if the log cannot be written, the request fails and nothing is revealed.
 
 | Action | Written when |
 |---|---|
@@ -203,6 +209,11 @@ before doing that: whatever terminates TLS sees personal data in request bodies,
 
 Connect to Postgres with `sslmode=verify-full`. sealbox warns at startup when it sees `sslmode=disable`.
 
+Two endpoints need no key: `GET /healthz`, which pings the database, and `GET /openapi.json`.
+
+The container image is distroless and runs as uid 65532. Mounted files, the schema, a keys file, TLS certificate and key,
+must be readable by that user.
+
 ## What it protects against
 
 - A dump of the database, or a stolen backup: ciphertext only, per-object keys wrapped under a master key that is never stored next to the data.
@@ -221,7 +232,7 @@ that decrypts a value and leaks it itself. Read [THREAT_MODEL.md](THREAT_MODEL.m
 | Self-hosted | one binary + Postgres | yes | no | library only |
 | Stores the data (tokenization) | yes | Enterprise only | yes | no |
 | Per-object key, crypto-shred | yes | no | vendor-specific | you build it |
-| Masking, roles, audit log | planned | partial | yes | no |
+| Masking, roles, audit log | yes | partial | yes | no |
 
 ## Quickstart
 
@@ -229,6 +240,9 @@ that decrypts a value and leaks it itself. Read [THREAT_MODEL.md](THREAT_MODEL.m
 printf 'SEALBOX_MASTER_KEY=%s\nSEALBOX_API_KEY=%s\n' "$(openssl rand -base64 32)" "$(openssl rand -base64 32)" > .env
 docker compose up --build
 ```
+
+A database belongs to one master key: the index key created on first start is wrapped under it. If you generate a new
+`.env`, start over with `docker compose down -v`.
 
 Then, in another shell:
 
@@ -252,9 +266,17 @@ SEALBOX_MASTER_KEY=$(openssl rand -base64 32) SEALBOX_API_KEY=$(openssl rand -ba
 SEALBOX_DATABASE_URL=postgres://user:pass@localhost:5432/sealbox SEALBOX_ADDR=127.0.0.1:8080 go run ./cmd/sealbox
 ```
 
-## Roadmap
+## Open
 
-Each item is one release.
+Not built yet, in the order they are likely to matter:
+
+- Rate limits on full reveal and search
+- A separate database role for migrations, so the runtime user can only insert into the audit log
+- Signed releases and an SBOM
+- Re-indexing existing objects when a field gains `index: true`
+- A third-party audit
+
+## Done
 
 - [x] Envelope encryption: XChaCha20-Poly1305, fresh key per object, ciphertext bound to the object id
 - [x] Postgres store; delete destroys the wrapped key, with a test that proves the ciphertext is dead
@@ -308,6 +330,8 @@ SEALBOX_TEST_DATABASE_URL=postgres://sealbox:sealbox@localhost:5432/sealbox?sslm
 ```
 
 Store tests are skipped when `SEALBOX_TEST_DATABASE_URL` is not set. CI runs them against a Postgres service.
+They use a fixed test master key, so a database that has already been used by the quickstart server, or was left mid-rotation
+by a killed run, refuses to open. Reset it with `docker compose down -v`.
 
 ## License
 

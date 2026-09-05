@@ -19,6 +19,8 @@ import (
 // tests that need isolation use values unique to the run.
 var testMasterKey = sha256.Sum256([]byte("sealbox test master key"))
 
+const actor = "test"
+
 // Tests need a real Postgres. Set SEALBOX_TEST_DATABASE_URL to run them;
 // they are skipped otherwise, except in CI where they must run. A local
 // database left mid-rotation by a crashed run is reset with
@@ -56,22 +58,48 @@ func newStore(t *testing.T) *Store {
 
 func mustPut(t *testing.T, s *Store, collection, plaintext string, indexed map[string]string) string {
 	t.Helper()
-	id, err := s.Put(context.Background(), collection, []byte(plaintext), indexed)
+	ids, err := s.PutMany(context.Background(), actor, collection, []Item{{Plaintext: []byte(plaintext), Indexed: indexed}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return id
+	return ids[0]
+}
+
+// get reads one object the way the API does.
+func get(s *Store, collection, id string) ([]byte, error) {
+	found, err := s.GetMany(context.Background(), collection, []string{id})
+	if err != nil {
+		return nil, err
+	}
+	plaintext, ok := found[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return plaintext, nil
 }
 
 // uniqueEmail returns an address no other run has indexed.
 func uniqueEmail() string { return newID()[4:16] + "@example.com" }
+
+func auditActions(t *testing.T, s *Store, id string) []string {
+	t.Helper()
+	rows, err := s.pool.Query(context.Background(), `SELECT action FROM audit_log WHERE object_id = $1 ORDER BY id`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return actions
+}
 
 func TestPutGetDelete(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	id := mustPut(t, s, "customers", `{"passport":"4510 123456"}`, nil)
 
-	got, err := s.Get(ctx, "customers", id)
+	got, err := get(s, "customers", id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,14 +107,18 @@ func TestPutGetDelete(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 
-	if err := s.Delete(ctx, "customers", id); err != nil {
+	if err := s.Delete(ctx, actor, "customers", id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(ctx, "customers", id); !errors.Is(err, ErrNotFound) {
+	if _, err := get(s, "customers", id); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("after delete: expected ErrNotFound, got %v", err)
 	}
-	if err := s.Delete(ctx, "customers", id); !errors.Is(err, ErrNotFound) {
+	if err := s.Delete(ctx, actor, "customers", id); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete: expected ErrNotFound, got %v", err)
+	}
+	// Create and delete are logged in the same transaction as the write.
+	if got := auditActions(t, s, id); !slices.Equal(got, []string{"create", "delete"}) {
+		t.Fatalf("audit: %v", got)
 	}
 }
 
@@ -96,7 +128,7 @@ func TestDeleteShredsCiphertext(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	id := mustPut(t, s, "customers", "secret", nil)
-	if err := s.Delete(ctx, "customers", id); err != nil {
+	if err := s.Delete(ctx, actor, "customers", id); err != nil {
 		t.Fatal(err)
 	}
 
@@ -119,16 +151,44 @@ func TestDeleteShredsCiphertext(t *testing.T) {
 }
 
 func TestCiphertextBoundToRow(t *testing.T) {
-	// Someone with SQL access moves a ciphertext to another id. It must not open there.
+	// Someone with SQL access moves a ciphertext to another id or collection.
+	// It must not open there.
 	ctx := context.Background()
 	s := newStore(t)
+
 	id := mustPut(t, s, "customers", "secret", nil)
 	moved := newID()
 	if _, err := s.pool.Exec(ctx, `UPDATE objects SET id = $2 WHERE id = $1`, id, moved); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Get(ctx, "customers", moved); !errors.Is(err, envelope.ErrOpen) {
-		t.Fatalf("moved ciphertext: expected ErrOpen, got %v", err)
+	if _, err := get(s, "customers", moved); !errors.Is(err, envelope.ErrOpen) {
+		t.Fatalf("moved id: expected ErrOpen, got %v", err)
+	}
+
+	id = mustPut(t, s, "customers", "secret", nil)
+	if _, err := s.pool.Exec(ctx, `UPDATE objects SET collection = 'employees' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := get(s, "employees", id); !errors.Is(err, envelope.ErrOpen) {
+		t.Fatalf("moved collection: expected ErrOpen, got %v", err)
+	}
+}
+
+func TestIndexKeyIsNotAnObject(t *testing.T) {
+	// The blind-index key row copied into objects under a matching collection
+	// and id must not open through the object path: service keys and objects
+	// live in different AAD namespaces.
+	ctx := context.Background()
+	s := newStore(t)
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO objects (id, collection, key_id, wrapped_dek, ciphertext)
+		 SELECT $1, $2, key_id, wrapped_dek, ciphertext FROM keys WHERE name = $3
+		 ON CONFLICT (id) DO NOTHING`, indexKeyName, "keys", indexKeyName); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.pool.Exec(ctx, `DELETE FROM objects WHERE id = $1`, indexKeyName) })
+	if _, err := get(s, "keys", indexKeyName); !errors.Is(err, envelope.ErrOpen) {
+		t.Fatalf("index key readable as an object: %v", err)
 	}
 }
 
@@ -136,20 +196,20 @@ func TestCollectionIsolation(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	id := mustPut(t, s, "customers", "secret", nil)
-	if _, err := s.Get(ctx, "employees", id); !errors.Is(err, ErrNotFound) {
+	if _, err := get(s, "employees", id); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get from other collection: expected ErrNotFound, got %v", err)
 	}
-	if err := s.Delete(ctx, "employees", id); !errors.Is(err, ErrNotFound) {
+	if err := s.Delete(ctx, actor, "employees", id); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("delete from other collection: expected ErrNotFound, got %v", err)
 	}
-	if _, err := s.Get(ctx, "customers", id); err != nil {
+	if _, err := get(s, "customers", id); err != nil {
 		t.Fatalf("object must be untouched: %v", err)
 	}
 }
 
 func TestGetUnknown(t *testing.T) {
 	s := newStore(t)
-	if _, err := s.Get(context.Background(), "customers", "tok_nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := get(s, "customers", "tok_nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -194,7 +254,7 @@ func TestSearch(t *testing.T) {
 	}
 
 	// Shredding removes the object from the index.
-	if err := s.Delete(ctx, "customers", a); err != nil {
+	if err := s.Delete(ctx, actor, "customers", a); err != nil {
 		t.Fatal(err)
 	}
 	if ids := search("customers", "email", email); !slices.Equal(ids, []string{b}) {
@@ -219,14 +279,14 @@ func TestPutManyGetMany(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	email := uniqueEmail()
-	ids, err := s.PutMany(ctx, "customers", []Item{
+	ids, err := s.PutMany(ctx, actor, "customers", []Item{
 		{Plaintext: []byte(`{"n":"1"}`)},
 		{Plaintext: []byte(`{"n":"2"}`), Indexed: map[string]string{"email": email}},
 	})
 	if err != nil || len(ids) != 2 {
 		t.Fatalf("got %v, %v", ids, err)
 	}
-	if err := s.Delete(ctx, "customers", ids[0]); err != nil {
+	if err := s.Delete(ctx, actor, "customers", ids[0]); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,6 +303,11 @@ func TestPutManyGetMany(t *testing.T) {
 	if hits, err := s.Search(ctx, "customers", "email", email); err != nil || !slices.Equal(hits, []string{ids[1]}) {
 		t.Fatalf("search after batch: %v, %v", hits, err)
 	}
+	for _, id := range ids {
+		if got := auditActions(t, s, id); got[0] != "create" {
+			t.Fatalf("batch create audit for %s: %v", id, got)
+		}
+	}
 }
 
 func TestRotate(t *testing.T) {
@@ -254,9 +319,17 @@ func TestRotate(t *testing.T) {
 	s := newStore(t)
 	id := mustPut(t, s, "customers", `{"n":"1"}`, map[string]string{"email": email})
 	gone := mustPut(t, s, "customers", "bye", nil)
-	if err := s.Delete(ctx, "customers", gone); err != nil {
+	if err := s.Delete(ctx, actor, "customers", gone); err != nil {
 		t.Fatal(err)
 	}
+	// A row naming a master key nobody has: rotation must report it and go on.
+	orphan := mustPut(t, s, "customers", "orphan", nil)
+	if _, err := s.pool.Exec(ctx, `UPDATE objects SET key_id = '0000000000000000' WHERE id = $1`, orphan); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		s.pool.Exec(ctx, `UPDATE objects SET deleted_at = now(), wrapped_dek = NULL WHERE id = $1`, orphan)
+	})
 
 	// Step 1: the new key is current, the old one still loaded.
 	both := openStore(t, fresh[:], old)
@@ -274,12 +347,15 @@ func TestRotate(t *testing.T) {
 	})
 
 	// Step 2: re-wrap.
-	rotated, _, err := both.Rotate(ctx)
+	rotated, skipped, err := both.Rotate(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if rotated < 2 {
 		t.Fatalf("expected at least the index key and one object, rotated %d", rotated)
+	}
+	if skipped < 1 {
+		t.Fatalf("the orphan row must be counted as skipped, got %d", skipped)
 	}
 	var keyID string
 	if err := s.pool.QueryRow(ctx, `SELECT key_id FROM objects WHERE id = $1`, id).Scan(&keyID); err != nil {
@@ -287,6 +363,9 @@ func TestRotate(t *testing.T) {
 	}
 	if keyID != envelope.KeyID(fresh[:]) {
 		t.Fatalf("object still under key %s", keyID)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT key_id FROM objects WHERE id = $1`, orphan).Scan(&keyID); err != nil || keyID != "0000000000000000" {
+		t.Fatalf("orphan row must be left alone: %q, %v", keyID, err)
 	}
 	var dek []byte
 	if err := s.pool.QueryRow(ctx, `SELECT wrapped_dek FROM objects WHERE id = $1`, gone).Scan(&dek); err != nil || dek != nil {
@@ -298,7 +377,7 @@ func TestRotate(t *testing.T) {
 
 	// Step 3: the old key retired. Reads and searches work with the new key alone.
 	only := openStore(t, fresh[:])
-	if got, err := only.Get(ctx, "customers", id); err != nil || string(got) != `{"n":"1"}` {
+	if got, err := get(only, "customers", id); err != nil || string(got) != `{"n":"1"}` {
 		t.Fatalf("get with new key only: %q, %v", got, err)
 	}
 	if ids, err := only.Search(ctx, "customers", "email", email); err != nil || !slices.Equal(ids, []string{id}) {
@@ -312,7 +391,7 @@ func TestRotate(t *testing.T) {
 	}
 }
 
-func TestAudit(t *testing.T) {
+func TestAuditMany(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 	client := "test-" + newID() // unique, so rows from other runs stay out of the way

@@ -95,7 +95,10 @@ func main() {
 		addr = ":8080"
 	}
 	cert, key := os.Getenv("SEALBOX_TLS_CERT"), os.Getenv("SEALBOX_TLS_KEY")
-	useTLS := cert != "" && key != ""
+	if (cert == "") != (key == "") {
+		log.Fatal("set both SEALBOX_TLS_CERT and SEALBOX_TLS_KEY, or neither")
+	}
+	useTLS := cert != ""
 	if !useTLS && !isLoopback(addr) && os.Getenv("SEALBOX_INSECURE_HTTP") != "1" {
 		log.Fatalf("refusing plaintext HTTP on %s: set SEALBOX_TLS_CERT and SEALBOX_TLS_KEY, or SEALBOX_INSECURE_HTTP=1 if TLS is terminated in front of sealbox", addr)
 	}
@@ -174,9 +177,17 @@ func loadMasterKeys() ([][]byte, error) {
 		raw = string(b)
 		sources++
 	}
-	if command := os.Getenv("SEALBOX_MASTER_KEY_COMMAND"); command != "" {
+	if command := os.Getenv("SEALBOX_MASTER_KEY_COMMAND"); strings.TrimSpace(command) != "" {
 		args := strings.Fields(command)
-		out, err := exec.Command(args[0], args[1:]...).Output()
+		cmd := exec.Command(args[0], args[1:]...)
+		// The command gets the environment it needs to reach the KMS, but
+		// not sealbox's own secrets.
+		for _, kv := range os.Environ() {
+			if !strings.HasPrefix(kv, "SEALBOX_") {
+				cmd.Env = append(cmd.Env, kv)
+			}
+		}
+		out, err := cmd.Output()
 		if err != nil {
 			return nil, errors.New("SEALBOX_MASTER_KEY_COMMAND failed: " + err.Error())
 		}

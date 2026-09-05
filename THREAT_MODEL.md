@@ -37,9 +37,10 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Erasure request while backups still exist | Delete destroys the wrapped DEK. All copies of the ciphertext become unrecoverable. |
 | Personal data in application logs, search indexes, analytics | The application never holds plaintext unless it explicitly reveals it. |
 | Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Every reveal is logged before the data is returned; batch reveal is capped at 1000 objects and logged per object. Planned: rate limits on full reveal. |
-| A reveal that leaves no trace | The audit entry is written first; if it fails, the request fails and nothing is returned. |
+| A reveal that leaves no trace | The audit entry is written first; if it fails, the request fails and nothing is returned. Creates and deletes commit with their entry in one transaction. |
 | Nonce reuse | Random 24-byte nonces (XChaCha20) and a fresh key per object. |
-| Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a key derived from the master key with HKDF. Without the master key a dump cannot confirm a guess. |
+| Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a random index key that is stored wrapped by the master key. Without the master key a dump cannot confirm a guess. |
+| Reading a service key through the object API | Service keys and objects are sealed in separate AAD namespaces, and ids are validated: a keys row copied into the objects table does not open. |
 | Shredded objects still findable by search | Delete removes the object's index rows in the same transaction that destroys its key. |
 | Master key sitting in the environment | It can come from a file or from a command, so a KMS or secret store hands it over at startup. |
 | A master key that must be retired | Several keys load at once; `sealbox rotate` re-wraps every key in pages while serving. Rotation never writes a key back into a row shredded meanwhile. |
@@ -64,5 +65,5 @@ If a claim in the README is not backed by a line here, the README is wrong.
 
 - The operator generates the master key with a CSPRNG and stores it outside the database.
 - Postgres is reachable only from sealbox.
-- Clocks are roughly correct (matters for the audit log, later).
+- Audit timestamps come from the Postgres clock.
 - `golang.org/x/crypto` and the Go standard library are correct. sealbox contains no cryptographic primitives of its own.

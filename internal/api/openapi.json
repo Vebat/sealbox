@@ -105,7 +105,8 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" }
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/TooLarge" }
         }
       }
     },
@@ -174,7 +175,8 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" }
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/TooLarge" }
         }
       }
     }
@@ -212,7 +214,7 @@
       "Object": {
         "type": "object",
         "additionalProperties": true,
-        "description": "Any JSON object up to 1 MiB. In a declared collection every value must be a string of the declared type and unknown fields are rejected.",
+        "description": "Any JSON object up to 1 MiB, valid UTF-8. In a declared collection every value must be a string of the declared type and unknown fields are rejected. What is stored and returned is the object re-encoded: keys sorted, each key once (last value wins), no whitespace.",
         "example": { "email": "ivan@example.com", "passport": "4510 123456" }
       },
       "MaskedObject": {
@@ -233,7 +235,7 @@
       "Unauthorized": { "description": "Missing or unknown API key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "Forbidden": { "description": "The client lacks the role. Checked before the object is looked up.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
       "NotFound": { "description": "No live object with that id in that collection.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "TooLarge": { "description": "Body over the limit: 1 MiB per object, 16 MiB per batch.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+      "TooLarge": { "description": "Body over the endpoint's limit: 1 MiB for one object, 16 MiB for a batch, 128 KiB for a reveal request, 4 KiB for a search. An oversize object inside a batch is a 400 naming its position.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
     }
   }
 }

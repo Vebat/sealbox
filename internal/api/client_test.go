@@ -46,6 +46,15 @@ func TestGoClient(t *testing.T) {
 	if err != nil || len(objects) != 2 || !slices.Equal(missing, []string{"tok_nope"}) {
 		t.Fatalf("reveal: %v, %v, %v", objects, missing, err)
 	}
+	objects, _, err = c.Reveal(ctx, "customers", batch[:1], true)
+	if err != nil || string(objects[batch[0]]) != `{"email":"a@example.com"}` {
+		t.Fatalf("reveal full: %s, %v", objects[batch[0]], err)
+	}
+	// A 404 that is not the vault's own "object not found" is a routing error.
+	var e *client.Error
+	if err := c.Delete(ctx, "cust/omers", batch[0]); !errors.As(err, &e) || e.Status != http.StatusNotFound || errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("bad collection: %v", err)
+	}
 
 	if err := c.Delete(ctx, "customers", id); err != nil {
 		t.Fatal(err)
@@ -58,7 +67,6 @@ func TestGoClient(t *testing.T) {
 	}
 
 	// Refusals come back as *client.Error with the status and the server's message.
-	var e *client.Error
 	err = client.New(srv.URL, supportKey).Delete(ctx, "customers", batch[0])
 	if !errors.As(err, &e) || e.Status != http.StatusForbidden || e.Message == "" {
 		t.Fatalf("forbidden: %v", err)

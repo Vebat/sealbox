@@ -69,6 +69,7 @@ func TestValidate(t *testing.T) {
 		{"subset of fields", "customers", `{"email":"ivan@example.com"}`, true},
 		{"unknown field", "customers", `{"ssn":"1"}`, false},
 		{"non-string value", "customers", `{"email": 5}`, false},
+		{"null value", "customers", `{"passport": null}`, false},
 		{"email without domain", "customers", `{"email":"ivan"}`, false},
 		{"email with space", "customers", `{"email":"iv an@example.com"}`, false},
 		{"phone too short", "customers", `{"phone":"12"}`, false},

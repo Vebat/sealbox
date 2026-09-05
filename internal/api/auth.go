@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -53,7 +54,7 @@ func LoadClients(path string) ([]Client, error) {
 	return ParseClients(data)
 }
 
-// ParseClients decodes a keys document, sorted by client name.
+// ParseClients decodes a keys document.
 func ParseClients(data []byte) ([]Client, error) {
 	var byName map[string]Client
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -66,17 +67,23 @@ func ParseClients(data []byte) ([]Client, error) {
 		c.Name = name
 		clients = append(clients, c)
 	}
-	slices.SortFunc(clients, func(a, b Client) int { return strings.Compare(a.Name, b.Name) })
 	return clients, ValidateClients(clients)
 }
 
-// ValidateClients rejects nameless clients, short or shared keys, and unknown roles.
+// ValidateClients rejects nameless or duplicate names, short or shared keys,
+// and unknown roles. Names must be unique because the audit log attributes
+// actions by name.
 func ValidateClients(clients []Client) error {
+	names := map[string]bool{}
 	owner := map[string]string{}
 	for _, c := range clients {
 		if c.Name == "" {
 			return errors.New("keys: client without a name")
 		}
+		if names[c.Name] {
+			return fmt.Errorf("keys: two clients named %s", c.Name)
+		}
+		names[c.Name] = true
 		if len(c.Key) < minKeyLen {
 			return fmt.Errorf("keys: %s: key must be at least %d characters", c.Name, minKeyLen)
 		}
@@ -96,18 +103,21 @@ func ValidateClients(clients []Client) error {
 	return nil
 }
 
-// authenticate finds the client presenting the bearer key. Every key is
-// compared in constant time, and all of them are compared, so timing does
-// not say which key was close or where it sits in the list.
+// authenticate finds the client presenting the bearer key. Both sides are
+// hashed first, so the constant-time comparison does not depend on the
+// key's length, and every client is compared, so timing does not say which
+// key was close or where it sits in the list.
 func authenticate(clients []Client, header string) (Client, bool) {
 	key, ok := strings.CutPrefix(header, "Bearer ")
 	if !ok {
 		return Client{}, false
 	}
+	got := sha256.Sum256([]byte(key))
 	var found Client
 	matched := false
 	for _, c := range clients {
-		if subtle.ConstantTimeCompare([]byte(key), []byte(c.Key)) == 1 {
+		want := sha256.Sum256([]byte(c.Key))
+		if subtle.ConstantTimeCompare(got[:], want[:]) == 1 {
 			found, matched = c, true
 		}
 	}

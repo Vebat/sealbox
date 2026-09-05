@@ -31,8 +31,8 @@ var (
 	// deliberately not distinguished: a caller must not learn whether the
 	// key, the nonce, the tag or the associated data was wrong.
 	ErrOpen = errors.New("envelope: open failed")
-	// ErrUnknownKey means the row was wrapped by a master key that is not
-	// loaded. Load it as a previous key, or rotate before retiring it.
+	// ErrUnknownKey means the row names a master key that is not loaded.
+	// Load it as a previous key, or rotate before retiring it.
 	ErrUnknownKey = errors.New("envelope: wrapped by a master key this server does not have")
 )
 
@@ -41,8 +41,7 @@ var (
 //
 // WrappedDEK is the per-object key encrypted under the master key named by
 // KeyID. Setting it to nil is the crypto-shred: Ciphertext can never be
-// opened again. An empty KeyID marks rows older than key ids; any loaded
-// master key may have wrapped them.
+// opened again.
 type Sealed struct {
 	KeyID      string
 	WrappedDEK []byte
@@ -53,7 +52,6 @@ type Sealed struct {
 type Envelope struct {
 	current string
 	keks    map[string]cipher.AEAD
-	order   []string // current first, then previous keys in the order given
 }
 
 // New returns an Envelope that seals under masterKey and also opens rows
@@ -69,10 +67,7 @@ func New(masterKey []byte, previous ...[]byte) (*Envelope, error) {
 		if e.current == "" {
 			e.current = id
 		}
-		if _, dup := e.keks[id]; !dup {
-			e.keks[id] = kek
-			e.order = append(e.order, id)
-		}
+		e.keks[id] = kek
 	}
 	return e, nil
 }
@@ -90,8 +85,8 @@ func KeyID(masterKey []byte) string {
 func (e *Envelope) CurrentKeyID() string { return e.current }
 
 // Seal encrypts plaintext under a fresh DEK wrapped by the current master
-// key. aad is authenticated but not encrypted; pass the object identity so a
-// ciphertext cannot be moved to another record without failing to open.
+// key. aad is authenticated but not encrypted; pass the row identity so a
+// ciphertext cannot be moved to another row without failing to open.
 func (e *Envelope) Seal(plaintext, aad []byte) (Sealed, error) {
 	dek := make([]byte, KeySize)
 	rand.Read(dek)
@@ -141,26 +136,17 @@ func (e *Envelope) Rewrap(s Sealed, aad []byte) (Sealed, bool, error) {
 	}, true, nil
 }
 
-// unwrap recovers the DEK under the master key named by s.KeyID. Rows
-// without a key id are tried against every loaded key.
+// unwrap recovers the DEK under the master key named by s.KeyID.
 func (e *Envelope) unwrap(s Sealed, aad []byte) ([]byte, error) {
-	if s.KeyID != "" {
-		kek, ok := e.keks[s.KeyID]
-		if !ok {
-			return nil, ErrUnknownKey
-		}
-		dek, err := open(kek, s.WrappedDEK, aad)
-		if err != nil {
-			return nil, ErrOpen
-		}
-		return dek, nil
+	kek, ok := e.keks[s.KeyID]
+	if !ok {
+		return nil, ErrUnknownKey
 	}
-	for _, id := range e.order {
-		if dek, err := open(e.keks[id], s.WrappedDEK, aad); err == nil {
-			return dek, nil
-		}
+	dek, err := open(kek, s.WrappedDEK, aad)
+	if err != nil {
+		return nil, ErrOpen
 	}
-	return nil, ErrUnknownKey
+	return dek, nil
 }
 
 // seal returns nonce || ciphertext with a fresh random nonce.

@@ -169,16 +169,13 @@ func TestRotation(t *testing.T) {
 	}
 }
 
-func TestRowsWithoutKeyID(t *testing.T) {
-	// Rows written before key ids existed are tried against every loaded key.
+func TestRewrapShredded(t *testing.T) {
+	// A shredded row has no key to re-wrap; rotation must not invent one.
 	a, b := randomKey(t), randomKey(t)
 	s := mustSeal(t, mustNew(t, a), "secret", "x")
-	s.KeyID = ""
-	if got, err := mustNew(t, b, a).Open(s, []byte("x")); err != nil || string(got) != "secret" {
-		t.Fatalf("legacy row with old key loaded: %q, %v", got, err)
-	}
-	if _, err := mustNew(t, b).Open(s, []byte("x")); !errors.Is(err, ErrUnknownKey) {
-		t.Fatalf("legacy row without its key: expected ErrUnknownKey, got %v", err)
+	s.WrappedDEK = nil
+	if _, _, err := mustNew(t, b, a).Rewrap(s, []byte("x")); !errors.Is(err, ErrOpen) {
+		t.Fatalf("expected ErrOpen, got %v", err)
 	}
 }
 

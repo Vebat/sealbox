@@ -106,7 +106,7 @@ func (s Schema) Validate(collection string, object map[string]json.RawMessage) e
 			return fmt.Errorf("unknown field %q", name)
 		}
 		var v string
-		if err := json.Unmarshal(raw, &v); err != nil {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &v) != nil {
 			return fmt.Errorf("field %q must be a string", name)
 		}
 		if err := types[f.Type].validate(v); err != nil {
