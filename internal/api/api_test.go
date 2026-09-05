@@ -3,10 +3,12 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,12 +21,22 @@ import (
 // store is tested against Postgres in internal/store; here only the HTTP
 // layer is under test.
 type fakeVault struct {
-	objects map[string][]byte
-	indexed map[string]map[string]string
+	objects   map[string][]byte
+	indexed   map[string]map[string]string
+	audit     []store.AuditEntry
+	failAudit bool
 }
 
 func newFakeVault() *fakeVault {
 	return &fakeVault{objects: map[string][]byte{}, indexed: map[string]map[string]string{}}
+}
+
+func (f *fakeVault) Audit(_ context.Context, e store.AuditEntry) error {
+	if f.failAudit {
+		return errors.New("audit log unavailable")
+	}
+	f.audit = append(f.audit, e)
+	return nil
 }
 
 func (f *fakeVault) Put(_ context.Context, collection string, plaintext []byte, indexed map[string]string) (string, error) {
@@ -84,6 +96,12 @@ const testSchema = `{"customers": {"fields": {
 
 func newServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	srv, _ := newServerWithVault(t)
+	return srv
+}
+
+func newServerWithVault(t *testing.T) (*httptest.Server, *fakeVault) {
+	t.Helper()
 	s, err := schema.Parse([]byte(testSchema))
 	if err != nil {
 		t.Fatal(err)
@@ -91,9 +109,10 @@ func newServer(t *testing.T) *httptest.Server {
 	if err := ValidateClients(testClients); err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(New(newFakeVault(), s, testClients))
+	vault := newFakeVault()
+	srv := httptest.NewServer(New(vault, s, testClients))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, vault
 }
 
 func do(t *testing.T, srv *httptest.Server, method, path, body, key string) (int, string) {
@@ -202,6 +221,54 @@ func TestSearch(t *testing.T) {
 		if strings.Contains(body, "4510") || strings.Contains(body, "123") {
 			t.Errorf("%s: response echoes submitted data: %s", name, body)
 		}
+	}
+}
+
+func TestAudit(t *testing.T) {
+	srv, vault := newServerWithVault(t)
+	path := create(t, srv, "customers", `{"email":"ivan@example.com"}`)
+	id := strings.TrimPrefix(path, "/v1/collections/customers/objects/")
+	do(t, srv, "GET", path, "", supportKey)
+	do(t, srv, "GET", path+"?reveal=full", "", privacyKey)
+	do(t, srv, "POST", "/v1/collections/customers/search", `{"email":"ivan@example.com"}`, supportKey)
+	do(t, srv, "DELETE", path, "", privacyKey)
+
+	want := []store.AuditEntry{
+		{Client: "admin", Action: "create", Collection: "customers", ObjectID: id},
+		{Client: "support", Action: "reveal_masked", Collection: "customers", ObjectID: id},
+		{Client: "privacy", Action: "reveal_full", Collection: "customers", ObjectID: id},
+		{Client: "support", Action: "search", Collection: "customers", Field: "email"},
+		{Client: "privacy", Action: "delete", Collection: "customers", ObjectID: id},
+	}
+	if !slices.Equal(vault.audit, want) {
+		t.Fatalf("audit log:\n got %+v\nwant %+v", vault.audit, want)
+	}
+
+	// Refused and failed requests leave no trace: nothing was revealed.
+	do(t, srv, "GET", path+"?reveal=full", "", supportKey) // 403
+	do(t, srv, "GET", path, "", adminKey)                  // 404, deleted
+	do(t, srv, "POST", "/v1/collections/customers/search", `{"passport":"x"}`, supportKey)
+	if len(vault.audit) != len(want) {
+		t.Fatalf("refused requests were logged: %+v", vault.audit[len(want):])
+	}
+}
+
+func TestNoRevealWithoutAudit(t *testing.T) {
+	srv, vault := newServerWithVault(t)
+	path := create(t, srv, "customers", `{"email":"ivan@example.com"}`)
+	vault.failAudit = true
+
+	status, body := do(t, srv, "GET", path+"?reveal=full", "", adminKey)
+	if status != http.StatusInternalServerError || strings.Contains(body, "ivan") {
+		t.Fatalf("reveal without audit: %d %s", status, body)
+	}
+	status, body = do(t, srv, "GET", path, "", adminKey)
+	if status != http.StatusInternalServerError || strings.Contains(body, "example.com") {
+		t.Fatalf("masked reveal without audit: %d %s", status, body)
+	}
+	status, body = do(t, srv, "POST", "/v1/collections/customers/search", `{"email":"ivan@example.com"}`, adminKey)
+	if status != http.StatusInternalServerError || strings.Contains(body, "tok_") {
+		t.Fatalf("search without audit: %d %s", status, body)
 	}
 }
 

@@ -7,6 +7,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,7 @@ type Vault interface {
 	Get(ctx context.Context, collection, id string) ([]byte, error)
 	Delete(ctx context.Context, collection, id string) error
 	Search(ctx context.Context, collection, field, normalized string) ([]string, error)
+	Audit(ctx context.Context, e store.AuditEntry) error
 }
 
 // New returns the /v1 handler. clients must have passed ValidateClients.
@@ -85,7 +87,31 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "put", err)
 		return
 	}
+	// ponytail: create and delete are logged after the write, not inside its
+	// transaction; move the entry into the store transaction if auditors need
+	// the two to be atomic.
+	if !s.audit(w, r, "create", collection, id, "") {
+		return
+	}
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
+}
+
+// audit writes an entry for the calling client and answers 500 on failure.
+// Reveals call it before writing the response, so no data leaves without a
+// log line.
+func (s *server) audit(w http.ResponseWriter, r *http.Request, action, collection, objectID, field string) bool {
+	err := s.vault.Audit(r.Context(), store.AuditEntry{
+		Client:     clientFrom(r).Name,
+		Action:     action,
+		Collection: collection,
+		ObjectID:   objectID,
+		Field:      field,
+	})
+	if err != nil {
+		internalError(w, "audit", err)
+		return false
+	}
+	return true
 }
 
 // search answers {"ids": [...]} for a body of exactly one indexed field and
@@ -119,6 +145,9 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 		if ids == nil {
 			ids = []string{}
 		}
+		if !s.audit(w, r, "search", collection, "", field) {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string][]string{"ids": ids})
 	}
 }
@@ -136,14 +165,17 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	if !require(w, r, role) {
 		return
 	}
-	collection := r.PathValue("collection")
-	plaintext, err := s.vault.Get(r.Context(), collection, r.PathValue("id"))
+	collection, id := r.PathValue("collection"), r.PathValue("id")
+	plaintext, err := s.vault.Get(r.Context(), collection, id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "object not found")
 		return
 	case err != nil:
 		internalError(w, "get", err)
+		return
+	}
+	if !s.audit(w, r, "reveal_"+cmp.Or(reveal, "masked"), collection, id, "") {
 		return
 	}
 	if reveal == "full" {
@@ -163,13 +195,14 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 	if !require(w, r, RoleDelete) {
 		return
 	}
-	err := s.vault.Delete(r.Context(), r.PathValue("collection"), r.PathValue("id"))
+	collection, id := r.PathValue("collection"), r.PathValue("id")
+	err := s.vault.Delete(r.Context(), collection, id)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "object not found")
 	case err != nil:
 		internalError(w, "delete", err)
-	default:
+	case s.audit(w, r, "delete", collection, id, ""):
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

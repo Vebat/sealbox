@@ -167,6 +167,26 @@ func (s *Store) Delete(ctx context.Context, collection, id string) error {
 	return tx.Commit(ctx)
 }
 
+// AuditEntry is one line of the audit log. Values never appear in it: only
+// who did what to which object, and for searches which field was queried.
+type AuditEntry struct {
+	Client     string
+	Action     string // create, reveal_masked, reveal_full, search, delete
+	Collection string
+	ObjectID   string // empty for search
+	Field      string // search only
+}
+
+// Audit appends an entry. Callers log a reveal before returning data, so a
+// failed insert means no reveal.
+func (s *Store) Audit(ctx context.Context, e AuditEntry) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO audit_log (client, action, collection, object_id, field)
+		 VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''))`,
+		e.Client, e.Action, e.Collection, e.ObjectID, e.Field)
+	return err
+}
+
 // aad binds a ciphertext to its row so it cannot be moved to another id or
 // collection at the database level.
 func aad(collection, id string) []byte { return []byte(collection + "/" + id) }

@@ -87,6 +87,30 @@ Rules:
 - Validation errors name the field, never the submitted value.
 - The schema is read at startup. Change the file, restart the process. Adding `index` to a field indexes new objects only; re-indexing existing ones is not built yet.
 
+## Audit log
+
+Every successful action is written to the `audit_log` table: which client did what, to which object, when.
+For a search, the field that was queried. Never a value, never a hash.
+A reveal is logged before the data is returned: if the log cannot be written, the request fails and nothing is revealed.
+
+| Action | Written when |
+|---|---|
+| `create` | an object was stored |
+| `reveal_masked` | a masked read |
+| `reveal_full` | a plaintext read |
+| `search` | a lookup by an indexed field |
+| `delete` | a crypto-shred |
+
+Read it with SQL. Everything about one person:
+
+```sql
+SELECT at, client, action FROM audit_log WHERE object_id = 'tok_...' ORDER BY at;
+```
+
+sealbox only inserts into this table. It does not yet separate the migration owner from the runtime user,
+so whoever holds the database credentials can still delete rows. If you need tamper evidence today,
+ship the table to storage the application cannot write to.
+
 ## Transport
 
 sealbox terminates TLS itself: set `SEALBOX_TLS_CERT` and `SEALBOX_TLS_KEY`. Without them it refuses to listen on
@@ -154,7 +178,7 @@ Each item is one release.
 - [x] Collection schemas from a JSON file; email, phone, card and string types; masked reads by default
 - [x] API keys per client with roles: write, delete, read_masked, read_full
 - [x] Blind index: exact-match search on indexed email, phone and card fields, own `search` role
-- [ ] Append-only audit log of every reveal
+- [x] Audit log: every create, reveal, search and delete, written before the data leaves
 - [ ] Batch import and batch reveal
 - [ ] OpenAPI spec and a generated client
 - [ ] Master key from a KMS, key rotation

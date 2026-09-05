@@ -9,6 +9,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/Vebat/sealbox/internal/envelope"
 )
 
@@ -181,5 +183,33 @@ func TestSearch(t *testing.T) {
 	}
 	if ids := search("customers", "email", "ivan@example.com"); !slices.Equal(ids, []string{b}) {
 		t.Fatalf("after delete: expected [%s], got %v", b, ids)
+	}
+}
+
+func TestAudit(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	client := "test-" + newID() // unique, so rows from other runs stay out of the way
+	want := []AuditEntry{
+		{Client: client, Action: "reveal_masked", Collection: "customers", ObjectID: newID()},
+		{Client: client, Action: "search", Collection: "customers", Field: "email"},
+	}
+	for _, e := range want {
+		if err := s.Audit(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT client, action, collection, coalesce(object_id, ''), coalesce(field, '')
+		 FROM audit_log WHERE client = $1 ORDER BY id`, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[AuditEntry])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
 	}
 }

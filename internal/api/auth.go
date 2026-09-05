@@ -127,10 +127,15 @@ func requireKey(clients []Client, next http.Handler) http.Handler {
 	})
 }
 
+// clientFrom returns the authenticated client stored by requireKey.
+func clientFrom(r *http.Request) Client {
+	c, _ := r.Context().Value(clientKey{}).(Client)
+	return c
+}
+
 // require answers 403 and returns false when the caller lacks role.
 func require(w http.ResponseWriter, r *http.Request, role string) bool {
-	c, _ := r.Context().Value(clientKey{}).(Client)
-	if c.has(role) {
+	if clientFrom(r).has(role) {
 		return true
 	}
 	writeError(w, http.StatusForbidden, "role "+role+" required")
