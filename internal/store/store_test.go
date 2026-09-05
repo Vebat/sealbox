@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Vebat/sealbox/internal/envelope"
 )
@@ -59,7 +61,7 @@ func localEnvelope(t *testing.T, current []byte, previous ...[]byte) *envelope.E
 
 func openStore(t *testing.T, current []byte, previous ...[]byte) *Store {
 	t.Helper()
-	s, err := Open(context.Background(), testDatabaseURL(t), localEnvelope(t, current, previous...))
+	s, err := Open(context.Background(), testDatabaseURL(t), localEnvelope(t, current, previous...), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +353,7 @@ func TestRotate(t *testing.T) {
 	both := openStore(t, fresh[:], old)
 	// Whatever happens below, leave the database on the shared test key.
 	t.Cleanup(func() {
-		back, err := Open(ctx, testDatabaseURL(t), localEnvelope(t, old, fresh[:]))
+		back, err := Open(ctx, testDatabaseURL(t), localEnvelope(t, old, fresh[:]), true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -399,7 +401,7 @@ func TestRotate(t *testing.T) {
 		t.Fatalf("search with new key only: %v, %v", ids, err)
 	}
 	// And the old key alone no longer opens the store.
-	if st, err := Open(ctx, testDatabaseURL(t), localEnvelope(t, old)); err == nil {
+	if st, err := Open(ctx, testDatabaseURL(t), localEnvelope(t, old), true); err == nil {
 		st.Close()
 		t.Fatal("old key alone must not open the store after rotation")
 	}
@@ -449,13 +451,13 @@ func TestRotateInPlace(t *testing.T) {
 	engine := &versioned{version: 1, keys: map[string]struct{ dek, aad []byte }{}}
 
 	// Move to the key service; leave the database on the test key afterwards.
-	s, err := Open(ctx, testDatabaseURL(t), envelope.New(engine, local))
+	s, err := Open(ctx, testDatabaseURL(t), envelope.New(engine, local), true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.Close)
 	t.Cleanup(func() {
-		back, err := Open(ctx, testDatabaseURL(t), envelope.New(local, engine))
+		back, err := Open(ctx, testDatabaseURL(t), envelope.New(local, engine), true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -548,6 +550,86 @@ func TestSubject(t *testing.T) {
 	}
 	if again, err := s.DeleteSubject(ctx, actor, subject); err != nil || len(again) != 0 {
 		t.Errorf("second erase must find nothing: %v, %v", again, err)
+	}
+}
+
+func TestRuntimeRole(t *testing.T) {
+	// The test database user owns the tables. A runtime role gets only what a
+	// running server needs, and the audit log becomes append-only for it.
+	ctx := context.Background()
+	owner := newStore(t)
+	role := "sealbox_app_" + newID()[4:12]
+	quoted := pgx.Identifier{role}.Sanitize()
+	if _, err := owner.pool.Exec(ctx, `CREATE ROLE `+quoted+` LOGIN PASSWORD 'runtime'`); err != nil {
+		t.Skipf("cannot create roles here: %v", err)
+	}
+	t.Cleanup(func() {
+		owner.pool.Exec(ctx, `DROP OWNED BY `+quoted)
+		owner.pool.Exec(ctx, `DROP ROLE `+quoted)
+	})
+	if err := owner.Grant(ctx, role); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Grant(ctx, role); err != nil {
+		t.Fatalf("grant must be repeatable: %v", err)
+	}
+
+	u, err := url.Parse(testDatabaseURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword(role, "runtime")
+	runtime, err := Open(ctx, u.String(), localEnvelope(t, testMasterKey[:]), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runtime.Close)
+
+	// Everything a server does works through the runtime role.
+	email := uniqueEmail()
+	id := mustPut(t, runtime, "customers", `{"n":"1"}`, map[string]string{"email": email})
+	if got, err := get(runtime, "customers", id); err != nil || string(got) != `{"n":"1"}` {
+		t.Fatalf("get: %q, %v", got, err)
+	}
+	if hits, err := runtime.Search(ctx, "customers", "email", email); err != nil || !slices.Equal(hits, []string{id}) {
+		t.Fatalf("search: %v, %v", hits, err)
+	}
+	if _, _, err := runtime.Rotate(ctx); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if err := runtime.Delete(ctx, actor, "customers", id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// But the audit log can only grow.
+	for name, stmt := range map[string]string{
+		"update":   `UPDATE audit_log SET client = 'x' WHERE object_id = $1`,
+		"delete":   `DELETE FROM audit_log WHERE object_id = $1`,
+		"truncate": `TRUNCATE audit_log`,
+	} {
+		var err error
+		if name == "truncate" {
+			_, err = runtime.pool.Exec(ctx, stmt)
+		} else {
+			_, err = runtime.pool.Exec(ctx, stmt, id)
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Errorf("%s on audit_log must be denied, got %v", name, err)
+		}
+	}
+	if got := auditActions(t, owner, id); !slices.Equal(got, []string{"create", "delete"}) {
+		t.Errorf("audit rows intact: %v", got)
+	}
+
+	// A binary that is ahead of the schema refuses to serve.
+	if _, err := owner.pool.Exec(ctx, `UPDATE schema_version SET version = version - 1`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { owner.pool.Exec(ctx, `UPDATE schema_version SET version = version + 1`) })
+	if st, err := Open(ctx, u.String(), localEnvelope(t, testMasterKey[:]), false); err == nil {
+		st.Close()
+		t.Fatal("runtime open must fail while the schema is behind")
 	}
 }
 

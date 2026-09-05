@@ -258,9 +258,23 @@ Read it with SQL. Everything about one person:
 SELECT at, client, action FROM audit_log WHERE object_id = 'tok_...' ORDER BY at;
 ```
 
-sealbox only inserts into this table. It does not yet separate the migration owner from the runtime user,
-so whoever holds the database credentials can still delete rows. If you need tamper evidence today,
-ship the table to storage the application cannot write to.
+sealbox only inserts into this table, and with two database roles that is all it can do:
+
+```sql
+CREATE ROLE sealbox_owner LOGIN PASSWORD '...';   -- owns the tables, runs migrations
+CREATE ROLE sealbox_app   LOGIN PASSWORD '...';   -- what the servers run as
+CREATE DATABASE sealbox OWNER sealbox_owner;
+```
+
+```sh
+SEALBOX_DATABASE_URL=postgres://sealbox_owner:...@db/sealbox SEALBOX_RUNTIME_ROLE=sealbox_app sealbox migrate
+```
+
+`sealbox migrate` applies pending migrations and grants `sealbox_app` exactly what a running server needs: read and
+write objects and keys, add and remove index rows, and append to the audit log, which it cannot update, delete or
+truncate. Run the servers as `sealbox_app` with `SEALBOX_MIGRATE=off`; they check that the schema is current and
+refuse to start otherwise. Repeat `sealbox migrate` on every upgrade. Whoever holds the owner credentials can still
+rewrite the log, so ship it off the box as well if you need tamper evidence against your own administrators.
 
 ## Transport
 
@@ -331,7 +345,6 @@ SEALBOX_DATABASE_URL=postgres://user:pass@localhost:5432/sealbox SEALBOX_ADDR=12
 
 Not built yet, in the order they are likely to matter:
 
-- A separate database role for migrations, so the runtime user can only insert into the audit log
 - Signed releases and an SBOM
 - Re-indexing existing objects when a field gains `index: true`
 - A third-party audit
@@ -351,6 +364,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Wrapping key in a key service: Vault and OpenBao transit, AWS KMS; migration by rotation
 - [x] Subjects: `_subject` on objects, list and erase everything about one person in one call
 - [x] Per-client reveal budget: full reveals and searches rate-limited, masked reads free
+- [x] Two database roles: `sealbox migrate` with the owner, servers with a role whose audit log is append-only
 
 ## Design rules
 

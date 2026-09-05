@@ -52,14 +52,22 @@ type Store struct {
 	index *envelope.Index
 }
 
-// Open connects to databaseURL, applies pending migrations and loads the
-// blind-index key, creating it on the very first start.
-func Open(ctx context.Context, databaseURL string, env *envelope.Envelope) (*Store, error) {
+// Open connects to databaseURL and loads the blind-index key, creating it on
+// the very first start. With migrate it also applies pending migrations,
+// which needs a role that owns the tables; without it, the role of a
+// running server, it only checks that the schema is current and refuses to
+// start otherwise.
+func Open(ctx context.Context, databaseURL string, env *envelope.Envelope, migrate bool) (*Store, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return nil, err
 	}
-	if err := migrateUp(ctx, pool); err != nil {
+	if migrate {
+		err = migrateUp(ctx, pool)
+	} else {
+		err = schemaCurrent(ctx, pool)
+	}
+	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("store: migrate: %w", err)
 	}
@@ -92,6 +100,46 @@ func migrateUp(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	return m.Migrate(ctx)
+}
+
+// schemaCurrent checks, with nothing but SELECT, that every embedded
+// migration has been applied.
+func schemaCurrent(ctx context.Context, pool *pgxpool.Pool) error {
+	files, err := fs.Glob(migrationsFS, "migrations/*.sql")
+	if err != nil {
+		return err
+	}
+	var version int32
+	if err := pool.QueryRow(ctx, `SELECT version FROM schema_version`).Scan(&version); err != nil {
+		return fmt.Errorf("reading schema_version (run \"sealbox migrate\" first): %w", err)
+	}
+	if int(version) != len(files) {
+		return fmt.Errorf("schema is at version %d, this binary needs %d: run \"sealbox migrate\" with the owner role", version, len(files))
+	}
+	return nil
+}
+
+// Grant gives a runtime role exactly what a running server does: read and
+// write objects and keys, add and remove index rows, and append to the
+// audit log, which it can never change or delete. Run by "sealbox migrate"
+// with the owner role. GRANT is idempotent, so it is safe to repeat.
+func (s *Store) Grant(ctx context.Context, role string) error {
+	r := pgx.Identifier{role}.Sanitize()
+	for _, stmt := range []string{
+		`GRANT USAGE ON SCHEMA public TO ` + r,
+		`GRANT SELECT ON schema_version TO ` + r,
+		`GRANT SELECT, INSERT, UPDATE ON objects TO ` + r,
+		`GRANT SELECT, INSERT, DELETE ON blind_index TO ` + r,
+		`GRANT SELECT, INSERT, UPDATE ON keys TO ` + r,
+		`GRANT SELECT, INSERT ON audit_log TO ` + r,
+		`REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM ` + r,
+		`GRANT USAGE, SELECT ON SEQUENCE audit_log_id_seq TO ` + r,
+	} {
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("store: grant: %w", err)
+		}
+	}
+	return nil
 }
 
 // loadIndexKey returns the blind-index key. Every starting replica proposes a

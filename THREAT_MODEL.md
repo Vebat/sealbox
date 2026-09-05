@@ -38,6 +38,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Personal data in application logs, search indexes, analytics | The application never holds plaintext unless it explicitly reveals it. |
 | Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Every reveal is logged before the data is returned; batch reveal is capped at 1000 objects and logged per object. Each client has a reveal budget: full reveals, per object, and searches beyond it are refused with 429. |
 | A reveal that leaves no trace | The audit entry is written first; if it fails, the request fails and nothing is returned. Creates and deletes commit with their entry in one transaction. |
+| A compromised server rewriting the audit log | Run the servers as the runtime role: it can append to the log and nothing else. |
 | Nonce reuse | Random 24-byte nonces (XChaCha20) and a fresh key per object. |
 | Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a random index key that is stored wrapped by the master key. Without the master key a dump cannot confirm a guess. |
 | Reading a service key through the object API | Service keys and objects are sealed in separate AAD namespaces, and ids are validated: a keys row copied into the objects table does not open. |
@@ -60,7 +61,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Traffic analysis | Object sizes and access patterns are visible to the database and the network. |
 | Equality leaking through the blind index | A dump shows which records share an indexed value, not what it is. Hashes are separated per collection and field, so the same value in two fields does not link them. Index only what you must search. |
 | Membership probing through search | Search confirms whether a value you already hold exists. It needs the `search` role, is logged, and spends the client's reveal budget, so probing a list of phone numbers runs at the budget's pace and shows in the log. |
-| Tampering with the audit log by whoever holds the database credentials | sealbox only inserts, but its database user owns the table. A separate migration role and external log shipping are planned. |
+| Tampering with the audit log by whoever holds the owner credentials | With two roles the servers can only append; the owner role that runs migrations can still rewrite the log. Ship it off the box if that matters. |
 | Side channels on shared hardware | Out of scope. |
 
 ## Assumptions

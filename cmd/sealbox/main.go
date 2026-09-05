@@ -1,5 +1,14 @@
-// Command sealbox runs the vault HTTP server, or with the argument "rotate"
-// re-wraps every key under the current wrapping key and exits.
+// Command sealbox runs the vault HTTP server. Two other invocations exist:
+//
+//	sealbox migrate  applies pending migrations with a role that owns the tables and,
+//	                 when SEALBOX_RUNTIME_ROLE is set, grants that role what a running
+//	                 server needs, with an audit log it can only append to
+//	sealbox rotate   re-wraps every key under the current wrapping key
+//
+// A server started with SEALBOX_MIGRATE=off never touches the schema; it
+// checks that the schema is current and refuses to start otherwise. That is
+// how the runtime role stays unable to alter tables or the audit log. The
+// default, auto, migrates at startup for single-role setups.
 //
 // Configuration is taken from the environment.
 //
@@ -23,6 +32,8 @@
 //	SEALBOX_KEYS_FILE      JSON file of named clients with API keys and roles, see keys.example.json
 //	SEALBOX_API_KEY        one extra API key holding every role, for development
 //	SEALBOX_DATABASE_URL   required, Postgres connection string; use sslmode=verify-full
+//	SEALBOX_MIGRATE        auto (default) migrates at startup; off only checks the schema
+//	SEALBOX_RUNTIME_ROLE   for "sealbox migrate": the database role the servers run as
 //	SEALBOX_SCHEMA         optional path to a JSON schema file, see schema.example.json
 //	SEALBOX_ADDR           listen address, default :8080
 //	SEALBOX_TLS_CERT       PEM certificate; together with SEALBOX_TLS_KEY enables TLS
@@ -72,8 +83,23 @@ func main() {
 		log.Print("warning: SEALBOX_DATABASE_URL has sslmode=disable; ciphertext and wrapped keys travel to Postgres in the clear")
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "rotate" {
-		rotate(dbURL, env)
+	migrate := true
+	switch os.Getenv("SEALBOX_MIGRATE") {
+	case "", "auto":
+	case "off":
+		migrate = false
+	default:
+		log.Fatal("SEALBOX_MIGRATE must be auto or off")
+	}
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "migrate":
+			migrateAndGrant(dbURL, env)
+		case "rotate":
+			rotate(dbURL, env, migrate)
+		default:
+			log.Fatalf("unknown command %q: expected migrate or rotate", os.Args[1])
+		}
 		return
 	}
 
@@ -112,7 +138,7 @@ func main() {
 	}
 
 	openCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	st, err := store.Open(openCtx, dbURL, env)
+	st, err := store.Open(openCtx, dbURL, env, migrate)
 	cancel()
 	if err != nil {
 		log.Fatal(err)
@@ -148,12 +174,31 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
+// migrateAndGrant applies pending migrations and, when SEALBOX_RUNTIME_ROLE
+// is set, grants that role what a running server needs.
+func migrateAndGrant(dbURL string, env *envelope.Envelope) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	st, err := store.Open(ctx, dbURL, env, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer st.Close()
+	log.Print("migrate: schema is current")
+	if role := os.Getenv("SEALBOX_RUNTIME_ROLE"); role != "" {
+		if err := st.Grant(ctx, role); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("migrate: role %s granted what a server needs; its audit log is append-only", role)
+	}
+}
+
 // rotate re-wraps every key under the current wrapping key. It runs against
 // a live database while the servers keep serving, and exits non-zero if any
 // row could not be re-wrapped.
-func rotate(dbURL string, env *envelope.Envelope) {
+func rotate(dbURL string, env *envelope.Envelope, migrate bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	st, err := store.Open(ctx, dbURL, env)
+	st, err := store.Open(ctx, dbURL, env, migrate)
 	cancel()
 	if err != nil {
 		log.Fatal(err)
