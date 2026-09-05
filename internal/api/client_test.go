@@ -50,10 +50,15 @@ func TestGoClient(t *testing.T) {
 	if err != nil || string(objects[batch[0]]) != `{"email":"a@example.com"}` {
 		t.Fatalf("reveal full: %s, %v", objects[batch[0]], err)
 	}
-	// A 404 that is not the vault's own "object not found" is a routing error.
+	// A 404 that is not the vault's own "object not found" is a routing
+	// error, for example a wrong base URL, and must not look like a missing
+	// object. A collection name with a slash is escaped and simply not found.
 	var e *client.Error
-	if err := c.Delete(ctx, "cust/omers", batch[0]); !errors.As(err, &e) || e.Status != http.StatusNotFound || errors.Is(err, client.ErrNotFound) {
-		t.Fatalf("bad collection: %v", err)
+	if err := client.New(srv.URL+"/nope", adminKey).Delete(ctx, "customers", batch[0]); !errors.As(err, &e) || e.Status != http.StatusNotFound || errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("wrong base URL: %v", err)
+	}
+	if err := c.Delete(ctx, "cust/omers", batch[0]); !errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("escaped collection: %v", err)
 	}
 
 	if err := c.Delete(ctx, "customers", id); err != nil {
