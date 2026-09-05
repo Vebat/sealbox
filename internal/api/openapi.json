@@ -1,0 +1,239 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "sealbox",
+    "version": "0.1.0",
+    "description": "Encrypted vault for personal data. Your application stores tokens; sealbox stores ciphertext under a key that exists only for that one object. Delete the key, shred the data. Every reveal is written to the audit log before the data is returned."
+  },
+  "servers": [{ "url": "/" }],
+  "security": [{ "bearer": [] }],
+  "paths": {
+    "/v1/collections/{collection}/objects": {
+      "post": {
+        "operationId": "createObject",
+        "summary": "Store one object. Role: write.",
+        "parameters": [{ "$ref": "#/components/parameters/collection" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Object" } } }
+        },
+        "responses": {
+          "201": {
+            "description": "Stored. Keep the id instead of the data.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "required": ["id"], "properties": { "id": { "$ref": "#/components/schemas/ID" } } }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+    "/v1/collections/{collection}/objects/batch": {
+      "post": {
+        "operationId": "createObjects",
+        "summary": "Store up to 1000 objects in one transaction. One invalid object fails the whole batch, named by position. Role: write.",
+        "parameters": [{ "$ref": "#/components/parameters/collection" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["objects"],
+                "properties": {
+                  "objects": { "type": "array", "minItems": 1, "maxItems": 1000, "items": { "$ref": "#/components/schemas/Object" } }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Stored. Ids in request order.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IDs" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+    "/v1/collections/{collection}/objects/reveal": {
+      "post": {
+        "operationId": "revealObjects",
+        "summary": "Read up to 1000 objects in one call. Role: read_masked, or read_full when reveal is full. One audit entry per object returned, written first.",
+        "parameters": [{ "$ref": "#/components/parameters/collection" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["ids"],
+                "properties": {
+                  "ids": { "type": "array", "minItems": 1, "maxItems": 1000, "items": { "$ref": "#/components/schemas/ID" } },
+                  "reveal": { "$ref": "#/components/schemas/Reveal" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Objects keyed by id. Ids that are unknown or deleted are listed under missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["objects", "missing"],
+                  "properties": {
+                    "objects": {
+                      "type": "object",
+                      "additionalProperties": { "oneOf": [{ "$ref": "#/components/schemas/Object" }, { "$ref": "#/components/schemas/MaskedObject" }] }
+                    },
+                    "missing": { "type": "array", "items": { "$ref": "#/components/schemas/ID" } }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/collections/{collection}/objects/{id}": {
+      "get": {
+        "operationId": "getObject",
+        "summary": "Read one object, masked unless reveal=full. Role: read_masked or read_full. Written to the audit log first.",
+        "parameters": [
+          { "$ref": "#/components/parameters/collection" },
+          { "$ref": "#/components/parameters/id" },
+          { "name": "reveal", "in": "query", "schema": { "$ref": "#/components/schemas/Reveal" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object, masked or in full.",
+            "content": {
+              "application/json": {
+                "schema": { "oneOf": [{ "$ref": "#/components/schemas/Object" }, { "$ref": "#/components/schemas/MaskedObject" }] }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "operationId": "deleteObject",
+        "summary": "Crypto-shred: destroy the object's key. Its ciphertext can never be opened again, in any backup or replica. Role: delete.",
+        "parameters": [
+          { "$ref": "#/components/parameters/collection" },
+          { "$ref": "#/components/parameters/id" }
+        ],
+        "responses": {
+          "204": { "description": "Shredded." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/collections/{collection}/search": {
+      "post": {
+        "operationId": "searchObjects",
+        "summary": "Find objects whose indexed field equals the value after normalization. Exactly one field. Exact match only. Role: search.",
+        "parameters": [{ "$ref": "#/components/parameters/collection" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "minProperties": 1,
+                "maxProperties": 1,
+                "additionalProperties": { "type": "string" },
+                "example": { "email": "ivan@example.com" }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ids of matching live objects, at most 100.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IDs" } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A client key from SEALBOX_KEYS_FILE. Each client has roles: write, delete, read_masked, read_full, search."
+      }
+    },
+    "parameters": {
+      "collection": {
+        "name": "collection",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+        "description": "Declared in the schema file, or free-form if not."
+      },
+      "id": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "$ref": "#/components/schemas/ID" }
+      }
+    },
+    "schemas": {
+      "ID": { "type": "string", "pattern": "^tok_[0-9a-f]{32}$", "example": "tok_9f3a1c2b4d5e6f708192a3b4c5d6e7f8" },
+      "IDs": {
+        "type": "object",
+        "required": ["ids"],
+        "properties": { "ids": { "type": "array", "items": { "$ref": "#/components/schemas/ID" } } }
+      },
+      "Object": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Any JSON object up to 1 MiB. In a declared collection every value must be a string of the declared type and unknown fields are rejected.",
+        "example": { "email": "ivan@example.com", "passport": "4510 123456" }
+      },
+      "MaskedObject": {
+        "type": "object",
+        "additionalProperties": { "type": "string" },
+        "description": "Every value replaced by its mask: i***@example.com, ***4567, **** **** **** 1234, or *** for anything else.",
+        "example": { "email": "i***@example.com", "passport": "***" }
+      },
+      "Reveal": { "type": "string", "enum": ["masked", "full"], "default": "masked" },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": { "error": { "type": "string", "description": "Names a field or a rule, never a submitted value." } }
+      }
+    },
+    "responses": {
+      "BadRequest": { "description": "Malformed body, unknown or invalid field, or bad parameter.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Unauthorized": { "description": "Missing or unknown API key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Forbidden": { "description": "The client lacks the role. Checked before the object is looked up.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "NotFound": { "description": "No live object with that id in that collection.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "TooLarge": { "description": "Body over the limit: 1 MiB per object, 16 MiB per batch.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    }
+  }
+}

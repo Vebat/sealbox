@@ -73,6 +73,32 @@ A batch stores up to 1000 objects in one transaction: one invalid object fails t
 Batch reveal returns up to 1000 objects in one call and writes one audit entry per object returned.
 Moving an existing table into sealbox is a loop of batches, replacing each row's columns with the returned id.
 
+## Clients
+
+The API is described in [openapi.json](internal/api/openapi.json), which a running server also serves at `/openapi.json`.
+A test keeps it in step with the registered routes. Generate a client for your language from it, for example:
+
+```sh
+npx openapi-typescript http://localhost:8080/openapi.json -o sealbox.d.ts
+```
+
+Go programs can use the client package directly:
+
+```go
+import "github.com/Vebat/sealbox/client"
+
+c := client.New("https://sealbox.internal:8080", os.Getenv("SEALBOX_KEY"))
+id, err := c.Create(ctx, "customers", map[string]string{"email": "ivan@example.com"})
+
+var masked map[string]string
+err = c.Get(ctx, "customers", id, false, &masked)          // {"email": "i***@example.com"}
+ids, err := c.Search(ctx, "customers", "email", "ivan@example.com")
+objects, missing, err := c.Reveal(ctx, "customers", ids, true)
+err = c.Delete(ctx, "customers", id)                       // client.ErrNotFound the second time
+```
+
+Refusals come back as `*client.Error` with the HTTP status and the server's message.
+
 ## Schemas
 
 A schema file, passed as `SEALBOX_SCHEMA`, declares what each collection holds. See [schema.example.json](schema.example.json):
@@ -196,7 +222,7 @@ Each item is one release.
 - [x] Blind index: exact-match search on indexed email, phone and card fields, own `search` role
 - [x] Audit log: every create, reveal, search and delete, written before the data leaves
 - [x] Batch create, atomic up to 1000 objects, and batch reveal with per-object audit
-- [ ] OpenAPI spec and a generated client
+- [x] OpenAPI spec, served at /openapi.json and tested against the routes; Go client package
 - [ ] Master key from a KMS, key rotation
 
 ## Design rules
@@ -211,7 +237,8 @@ Each item is one release.
 
 ```
 cmd/sealbox/                entry point, config from env, TLS
-internal/api/               HTTP handlers, clients and roles, input limits
+client/                     Go client for the API
+internal/api/               HTTP handlers, clients and roles, input limits, openapi.json
 internal/envelope/          per-object keys wrapped under the master key
 internal/schema/            field types, validation, masks; loaded from SEALBOX_SCHEMA
 internal/store/             Postgres; delete nulls the wrapped key, the row stays

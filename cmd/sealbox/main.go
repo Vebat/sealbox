@@ -99,6 +99,10 @@ func main() {
 		}
 		w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("GET /openapi.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(api.OpenAPI)
+	})
 	mux.Handle("/v1/", api.New(st, sc, clients))
 
 	srv := &http.Server{

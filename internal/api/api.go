@@ -10,6 +10,7 @@ package api
 import (
 	"cmp"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,12 @@ import (
 	"github.com/Vebat/sealbox/internal/schema"
 	"github.com/Vebat/sealbox/internal/store"
 )
+
+// OpenAPI is the API description. A test checks that it documents exactly
+// the routes registered here; the server serves it at /openapi.json.
+//
+//go:embed openapi.json
+var OpenAPI []byte
 
 const (
 	maxBody      = 1 << 20   // one object; large blobs belong in object storage
@@ -46,18 +53,28 @@ type Vault interface {
 func New(v Vault, s schema.Schema, clients []Client) http.Handler {
 	srv := &server{vault: v, schema: s}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/collections/{collection}/objects", srv.create)
-	mux.HandleFunc("POST /v1/collections/{collection}/objects/batch", srv.createBatch)
-	mux.HandleFunc("POST /v1/collections/{collection}/objects/reveal", srv.revealBatch)
-	mux.HandleFunc("GET /v1/collections/{collection}/objects/{id}", srv.get)
-	mux.HandleFunc("DELETE /v1/collections/{collection}/objects/{id}", srv.delete)
-	mux.HandleFunc("POST /v1/collections/{collection}/search", srv.search)
+	for pattern, handle := range srv.routes() {
+		mux.HandleFunc(pattern, handle)
+	}
 	return requireKey(clients, mux)
 }
 
 type server struct {
 	vault  Vault
 	schema schema.Schema
+}
+
+// routes maps mux patterns to handlers. openapi.json must document exactly
+// these; a test checks.
+func (s *server) routes() map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		"POST /v1/collections/{collection}/objects":        s.create,
+		"POST /v1/collections/{collection}/objects/batch":  s.createBatch,
+		"POST /v1/collections/{collection}/objects/reveal": s.revealBatch,
+		"GET /v1/collections/{collection}/objects/{id}":    s.get,
+		"DELETE /v1/collections/{collection}/objects/{id}": s.delete,
+		"POST /v1/collections/{collection}/search":         s.search,
+	}
 }
 
 func (s *server) create(w http.ResponseWriter, r *http.Request) {
