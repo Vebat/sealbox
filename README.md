@@ -2,7 +2,65 @@
 
 Encrypted vault for personal data. Delete the key, shred the data.
 
+Your application keeps a token. sealbox keeps the ciphertext, under a key that exists only for that one object.
+Erase a person and their keys are destroyed: the rows stay, the data is gone, and the audit log says who saw
+what before that.
+
+```
+your app ──── token ──────▶ your database
+your app ──── data ───────▶ sealbox ──── ciphertext ──────▶ Postgres
+                            one key per object, wrapped by a master key or by your KMS
+```
+
 > **Status: pre-alpha, not audited.** Nothing here has been reviewed by anyone but the author. Do not put real data in it yet.
+
+## Sixty seconds
+
+Store something about a person, look at the database, erase the person, look again. Real output, shortened.
+
+```console
+$ curl -H "Authorization: Bearer $KEY" -d '{"_subject":"user:42","email":"ivan@example.com","phone":"+7 921 123-45-67"}' \
+    localhost:8080/v1/collections/customers/objects
+{"id":"tok_cefc5caf408ced67acef4e613e5dd12a"}
+
+$ psql sealbox -c "SELECT id, subject_id, ciphertext, wrapped_dek IS NOT NULL AS has_key FROM objects"
+      id       | subject_id |    ciphertext     | has_key
+---------------+------------+-------------------+---------
+ tok_cefc5caf… | user:42    | dd980e9b4bcbad1a… | t
+
+$ curl -H "Authorization: Bearer $KEY" localhost:8080/v1/collections/customers/objects/tok_cefc5caf…
+{"email":"i***@example.com","phone":"***4567"}
+
+$ curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/collections/customers/objects/tok_cefc5caf…?reveal=full"
+{"email":"ivan@example.com","phone":"+7 921 123-45-67"}
+
+$ curl -H "Authorization: Bearer $KEY" -d '{"email":"IVAN@example.com"}' localhost:8080/v1/collections/customers/search
+{"ids":["tok_cefc5caf408ced67acef4e613e5dd12a"]}
+
+$ curl -X DELETE -H "Authorization: Bearer $KEY" localhost:8080/v1/subjects/user:42
+{"erased":[{"collection":"customers","id":"tok_cefc5caf408ced67acef4e613e5dd12a"}]}
+
+$ psql sealbox -c "SELECT id, subject_id, ciphertext, wrapped_dek IS NOT NULL AS has_key FROM objects"
+      id       | subject_id |    ciphertext     | has_key
+---------------+------------+-------------------+---------
+ tok_cefc5caf… | user:42    | dd980e9b4bcbad1a… | f
+
+$ curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/collections/customers/objects/tok_cefc5caf…?reveal=full"
+{"error":"object not found"}
+
+$ psql sealbox -c "SELECT client, action, object_id FROM audit_log ORDER BY id"
+ client  |    action     |   object_id
+---------+---------------+---------------
+ default | create        | tok_cefc5caf…
+ default | reveal_masked | tok_cefc5caf…
+ default | reveal_full   | tok_cefc5caf…
+ default | search        |
+ default | delete        | tok_cefc5caf…
+```
+
+The row is still there. Its ciphertext is still there. Its key is not, so the ciphertext is noise: here, in every
+replica, and in every backup taken from now on. Backups taken before die with the next master key rotation.
+Every reveal was written to the audit log before the data left. Run it yourself: [Quickstart](#quickstart).
 
 ## The problem
 
