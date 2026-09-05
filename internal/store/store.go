@@ -264,20 +264,33 @@ func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (m
 		return nil, err
 	}
 	defer rows.Close()
-	found := make(map[string][]byte, len(ids))
+	var rowIDs []string
+	var sealed []envelope.Sealed
+	var aads [][]byte
 	for rows.Next() {
 		var id string
-		var sealed envelope.Sealed
-		if err := rows.Scan(&id, &sealed.KeyID, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
+		var s envelope.Sealed
+		if err := rows.Scan(&id, &s.KeyID, &s.WrappedDEK, &s.Ciphertext); err != nil {
 			return nil, err
 		}
-		plaintext, err := s.env.Open(ctx, sealed, aad(collection, id))
-		if err != nil {
-			return nil, fmt.Errorf("object %s: %w", id, err)
-		}
-		found[id] = plaintext
+		rowIDs, sealed, aads = append(rowIDs, id), append(sealed, s), append(aads, aad(collection, id))
 	}
-	return found, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// One round trip per wrapper for key services that support it.
+	plaintexts, errs, err := s.env.OpenMany(ctx, sealed, aads)
+	if err != nil {
+		return nil, err
+	}
+	found := make(map[string][]byte, len(rowIDs))
+	for i, id := range rowIDs {
+		if errs[i] != nil {
+			return nil, fmt.Errorf("object %s: %w", id, errs[i])
+		}
+		found[id] = plaintexts[i]
+	}
+	return found, nil
 }
 
 // SearchPage is how many ids one Search returns at most.

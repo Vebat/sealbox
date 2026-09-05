@@ -65,6 +65,20 @@ type Rewrapper interface {
 	Rewrap(ctx context.Context, wrapped, aad []byte) ([]byte, bool, error)
 }
 
+// BatchUnwrapper is a Wrapper that can unwrap many keys in one round trip.
+// Each result carries its own error, ErrOpen for a key that does not open;
+// the returned error is for the round trip as a whole.
+type BatchUnwrapper interface {
+	Wrapper
+	UnwrapMany(ctx context.Context, wrapped, aads [][]byte) ([]Unwrapped, error)
+}
+
+// Unwrapped is one result of UnwrapMany.
+type Unwrapped struct {
+	DEK []byte
+	Err error
+}
+
 // Local wraps with a master key held in this process: XChaCha20-Poly1305
 // with the row identity as associated data.
 type Local struct {
@@ -173,11 +187,68 @@ func (e *Envelope) Open(ctx context.Context, s Sealed, aad []byte) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
+	return openWithDEK(dek, s.Ciphertext, aad)
+}
+
+// OpenMany decrypts several values, grouping them by wrapper so a key
+// service that supports it is asked once per group instead of once per
+// value. Results are in input order; each carries its own error. The
+// returned error means a backend could not be reached and no result is
+// usable.
+func (e *Envelope) OpenMany(ctx context.Context, sealed []Sealed, aads [][]byte) ([][]byte, []error, error) {
+	plaintexts := make([][]byte, len(sealed))
+	errs := make([]error, len(sealed))
+	byKey := map[string][]int{}
+	for i, s := range sealed {
+		byKey[s.KeyID] = append(byKey[s.KeyID], i)
+	}
+	for keyID, idx := range byKey {
+		w, ok := e.all[keyID]
+		if !ok {
+			for _, i := range idx {
+				errs[i] = ErrUnknownKey
+			}
+			continue
+		}
+		deks := make([]Unwrapped, len(idx))
+		if bu, ok := w.(BatchUnwrapper); ok {
+			wrapped, groupAADs := make([][]byte, len(idx)), make([][]byte, len(idx))
+			for j, i := range idx {
+				wrapped[j], groupAADs[j] = sealed[i].WrappedDEK, aads[i]
+			}
+			var err error
+			if deks, err = bu.UnwrapMany(ctx, wrapped, groupAADs); err != nil {
+				return nil, nil, err
+			}
+		} else {
+			for j, i := range idx {
+				deks[j].DEK, deks[j].Err = w.Unwrap(ctx, sealed[i].WrappedDEK, aads[i])
+				if deks[j].Err != nil && !errors.Is(deks[j].Err, ErrOpen) {
+					return nil, nil, deks[j].Err
+				}
+			}
+		}
+		for j, i := range idx {
+			if deks[j].Err != nil {
+				errs[i] = deks[j].Err
+				continue
+			}
+			plaintexts[i], errs[i] = openWithDEK(deks[j].DEK, sealed[i].Ciphertext, aads[i])
+		}
+	}
+	return plaintexts, errs, nil
+}
+
+// openWithDEK decrypts one value under its already unwrapped key.
+func openWithDEK(dek, ciphertext, aad []byte) ([]byte, error) {
+	if len(dek) != KeySize {
+		return nil, ErrOpen
+	}
 	dataAEAD, err := chacha20poly1305.NewX(dek)
 	if err != nil {
 		return nil, ErrOpen
 	}
-	plaintext, err := open(dataAEAD, s.Ciphertext, aad)
+	plaintext, err := open(dataAEAD, ciphertext, aad)
 	if err != nil {
 		return nil, ErrOpen
 	}

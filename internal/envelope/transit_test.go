@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 type fakeEngine struct {
 	token   string
 	version string
+	calls   int // batch decrypt round trips
 	store   map[string]struct{ plaintext, context string }
 }
 
@@ -46,13 +48,31 @@ func (e *fakeEngine) handler() http.Handler {
 			fail(w, http.StatusForbidden, "permission denied")
 			return
 		}
-		var req map[string]string
+		var req map[string]any
 		json.NewDecoder(r.Body).Decode(&req)
+		str := func(k string) string { s, _ := req[k].(string); return s }
 		op := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/transit/"), "/")[0]
+		if batch, ok := req["batch_input"].([]any); ok && op == "decrypt" {
+			e.calls++
+			results := make([]map[string]string, 0, len(batch))
+			for _, item := range batch {
+				m, _ := item.(map[string]any)
+				ct, _ := m["ciphertext"].(string)
+				cx, _ := m["context"].(string)
+				if entry, ok := e.store[ct]; ok && entry.context == cx {
+					results = append(results, map[string]string{"plaintext": entry.plaintext})
+				} else {
+					results = append(results, map[string]string{"error": "invalid ciphertext"})
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"batch_results": results}})
+			return
+		}
 		switch op {
 		case "encrypt":
-			json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{"ciphertext": e.seal(req["plaintext"], req["context"])}})
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]string{"ciphertext": e.seal(str("plaintext"), str("context"))}})
 		case "decrypt", "rewrap":
+			req := map[string]string{"ciphertext": str("ciphertext"), "context": str("context")}
 			entry, ok := e.store[req["ciphertext"]]
 			if !ok || entry.context != req["context"] {
 				fail(w, http.StatusBadRequest, "invalid ciphertext")
@@ -130,6 +150,60 @@ func TestTransitRewrapInPlace(t *testing.T) {
 	}
 	if _, _, err := e.Rewrap(ctx, s, []byte("other")); !errors.Is(err, ErrOpen) {
 		t.Fatalf("rewrap with wrong aad: %v", err)
+	}
+}
+
+func TestTransitBatch(t *testing.T) {
+	srv, engine := newFakeEngine(t, "s.token")
+	transit := NewTransit(srv.URL, "transit", "sealbox", "s.token")
+	key := randomKey(t)
+	e := New(transit, local(t, key))
+
+	// Three rows under transit, one under the local key, one tampered, one
+	// under a key nobody has: one round trip for the transit group.
+	var sealed []Sealed
+	var aads [][]byte
+	for i := range 3 {
+		aad := fmt.Sprintf("row-%d", i)
+		sealed = append(sealed, mustSeal(t, e, "secret-"+aad, aad))
+		aads = append(aads, []byte(aad))
+	}
+	sealed = append(sealed, mustSeal(t, mustNew(t, key), "local", "row-local"))
+	aads = append(aads, []byte("row-local"))
+	tampered := sealed[0]
+	tampered.WrappedDEK = append([]byte{}, sealed[0].WrappedDEK...)
+	tampered.WrappedDEK[len(tampered.WrappedDEK)-1] ^= 1
+	sealed = append(sealed, tampered)
+	aads = append(aads, []byte("row-0"))
+	sealed = append(sealed, Sealed{KeyID: "nobody", WrappedDEK: []byte("x"), Ciphertext: []byte("y")})
+	aads = append(aads, []byte("row-x"))
+
+	plaintexts, errs, err := e.OpenMany(ctx, sealed, aads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine.calls != 1 {
+		t.Fatalf("expected one batch round trip, got %d", engine.calls)
+	}
+	for i := range 3 {
+		if errs[i] != nil || string(plaintexts[i]) != fmt.Sprintf("secret-row-%d", i) {
+			t.Errorf("row %d: %q, %v", i, plaintexts[i], errs[i])
+		}
+	}
+	if errs[3] != nil || string(plaintexts[3]) != "local" {
+		t.Errorf("local row: %q, %v", plaintexts[3], errs[3])
+	}
+	if !errors.Is(errs[4], ErrOpen) {
+		t.Errorf("tampered row: %v", errs[4])
+	}
+	if !errors.Is(errs[5], ErrUnknownKey) {
+		t.Errorf("unknown key row: %v", errs[5])
+	}
+
+	// A backend that is down fails the whole call rather than every row.
+	srv.Close()
+	if _, _, err := e.OpenMany(ctx, sealed[:3], aads[:3]); err == nil {
+		t.Fatal("expected a round-trip error")
 	}
 }
 

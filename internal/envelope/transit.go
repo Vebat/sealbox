@@ -15,11 +15,9 @@ import (
 // Transit wraps per-object keys with the transit secrets engine of
 // HashiCorp Vault or OpenBao. The wrapping key never leaves the engine:
 // sealbox sends each DEK to be encrypted and asks for it back to be
-// decrypted, one call per key. The row identity goes along as the transit
-// context; create the key with derived=true and the engine enforces it.
-//
-// ponytail: one HTTP call per wrapped key. Transit has batch_input; use it
-// for batch reveal when latency matters.
+// decrypted, one call per key on single reads and one call per batchSize
+// keys on batch reads. The row identity goes along as the transit context;
+// create the key with derived=true and the engine enforces it.
 type Transit struct {
 	addr, mount, key, token string
 	http                    *http.Client
@@ -79,6 +77,54 @@ func (t *Transit) Unwrap(ctx context.Context, wrapped, aad []byte) ([]byte, erro
 	return dek, nil
 }
 
+// UnwrapMany decrypts up to batchSize keys per round trip through the
+// engine's batch_input. A key the engine rejects comes back with ErrOpen in
+// its slot; a failed round trip fails the call.
+func (t *Transit) UnwrapMany(ctx context.Context, wrapped, aads [][]byte) ([]Unwrapped, error) {
+	out := make([]Unwrapped, 0, len(wrapped))
+	for start := 0; start < len(wrapped); start += batchSize {
+		end := min(start+batchSize, len(wrapped))
+		items := make([]map[string]string, 0, end-start)
+		for i := start; i < end; i++ {
+			items = append(items, map[string]string{
+				"ciphertext": string(wrapped[i]),
+				"context":    base64.StdEncoding.EncodeToString(aads[i]),
+			})
+		}
+		var res struct {
+			Data struct {
+				Results []struct {
+					Plaintext string `json:"plaintext"`
+					Error     string `json:"error"`
+				} `json:"batch_results"`
+			} `json:"data"`
+		}
+		if err := t.call(ctx, "decrypt", map[string]any{"batch_input": items}, &res); err != nil {
+			return nil, err
+		}
+		if len(res.Data.Results) != len(items) {
+			return nil, fmt.Errorf("transit decrypt: %d results for %d inputs", len(res.Data.Results), len(items))
+		}
+		for _, r := range res.Data.Results {
+			if r.Error != "" {
+				out = append(out, Unwrapped{Err: fmt.Errorf("%w: transit decrypt: %s", ErrOpen, r.Error)})
+				continue
+			}
+			dek, err := base64.StdEncoding.DecodeString(r.Plaintext)
+			if err != nil {
+				out = append(out, Unwrapped{Err: ErrOpen})
+				continue
+			}
+			out = append(out, Unwrapped{DEK: dek})
+		}
+	}
+	return out, nil
+}
+
+// batchSize is how many keys one batch_input carries; a batch reveal of a
+// thousand objects is two round trips.
+const batchSize = 500
+
 // Rewrap asks the engine to re-encrypt the wrapped key under its current key
 // version. Engines answer with fresh ciphertext even when the version did not
 // move, so the version segment of the ciphertext decides whether anything
@@ -116,7 +162,7 @@ func version(ciphertext string) string {
 // call posts to /v1/<mount>/<op>/<key>. A 400 means the engine rejected the
 // ciphertext or context and maps to ErrOpen; anything else is a backend
 // failure and keeps its own message, which never contains key material.
-func (t *Transit) call(ctx context.Context, op string, body map[string]string, out any) error {
+func (t *Transit) call(ctx context.Context, op string, body any, out any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err

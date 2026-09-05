@@ -208,7 +208,8 @@ same through the encryption context. AWS support is compiled in only with `go bu
 
 Moving an existing database to a key service is a rotation: set `SEALBOX_KMS`, keep the master key configured so
 it opens the old rows, restart, run `sealbox rotate`, then drop the master key. Every wrap and unwrap is a network
-call, so expect a few milliseconds per object on reads.
+call, so expect a few milliseconds per single read. Batch reveals go through the engine's `batch_input`, 500 keys
+per round trip, so a page of a thousand objects is two calls, not a thousand.
 
 Rotating the key inside the service is finished the same way. After `vault write -f transit/keys/sealbox/rotate`,
 or a new master key version in keeper, run `sealbox rotate`: it asks the engine to re-wrap every key under the
@@ -375,7 +376,6 @@ The release notes are the tag's annotation.
 Not built yet, in the order they are likely to matter:
 
 - A third-party audit
-- A DEK cache and transit `batch_input`, so a batch reveal through a key service is not one call per object
 - Partial indexes on declared fragments, such as the last four digits of a card
 - A Helm chart
 - Client wrappers for ORMs, and a proxy mode that keeps card numbers out of the application entirely
@@ -401,6 +401,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Prometheus metrics on a separate address
 - [x] Search pagination with an `after` cursor
 - [x] Signed releases with an SBOM on every tag
+- [x] Batch reads through a key service unwrap 500 keys per round trip
 
 ## Design rules
 
