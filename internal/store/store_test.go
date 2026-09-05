@@ -17,6 +17,9 @@ func newStore(t *testing.T) *Store {
 	t.Helper()
 	url := os.Getenv("SEALBOX_TEST_DATABASE_URL")
 	if url == "" {
+		if os.Getenv("CI") != "" {
+			t.Fatal("SEALBOX_TEST_DATABASE_URL must be set in CI: store tests must never be skipped there")
+		}
 		t.Skip("SEALBOX_TEST_DATABASE_URL not set")
 	}
 	key := make([]byte, envelope.KeySize)
