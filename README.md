@@ -294,6 +294,9 @@ session at all; API keys still say who they are. TLS is 1.3 only.
 
 Two endpoints need no key: `GET /healthz`, which pings the database, and `GET /openapi.json`.
 
+`SEALBOX_METRICS_ADDR=127.0.0.1:9090` serves Prometheus metrics at `/metrics` on that address, never on the API
+port: requests per route and status, and time spent per route. Routes are patterns, so no id or token appears.
+
 On Linux sealbox disables core dumps and marks itself non-dumpable at start, so a crash or a debugger of the same
 user does not write key material to disk.
 
@@ -377,6 +380,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Two database roles: `sealbox migrate` with the owner, servers with a role whose audit log is append-only
 - [x] Hardening: audit entries to stdout for shipping, no core dumps on Linux, client certificates for the API
 - [x] `sealbox reindex`: rebuild the blind index for existing objects under a changed schema
+- [x] Prometheus metrics on a separate address
 
 ## Design rules
 
@@ -392,7 +396,8 @@ Not built yet, in the order they are likely to matter:
 cmd/sealbox/                entry point, config from env, TLS
 client/                     Go client for the API
 internal/api/               HTTP handlers, clients and roles, input limits, openapi.json
-internal/envelope/          per-object keys wrapped under the master key
+internal/envelope/          per-object keys wrapped under the master key, or by a key service
+internal/metrics/           request counters in the Prometheus text format
 internal/schema/            field types, validation, masks; loaded from SEALBOX_SCHEMA
 internal/store/             Postgres; delete nulls the wrapped key, the row stays
 internal/store/migrations/  numbered SQL files, applied once each at startup

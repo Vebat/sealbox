@@ -44,6 +44,7 @@
 //	SEALBOX_TLS_CLIENT_CA  PEM CA bundle; when set, clients must present a certificate it signed
 //	SEALBOX_INSECURE_HTTP  "1" allows plaintext HTTP on a non-loopback address
 //	SEALBOX_AUDIT_STDOUT   "1" also writes every audit entry to stdout as JSON, for shipping off the host
+//	SEALBOX_METRICS_ADDR   serves Prometheus metrics at /metrics on this address, e.g. 127.0.0.1:9090; off when empty
 //
 // Without a certificate the server only listens on loopback addresses, unless
 // SEALBOX_INSECURE_HTTP=1 states that TLS is terminated by something in front
@@ -71,6 +72,7 @@ import (
 
 	"github.com/Vebat/sealbox/internal/api"
 	"github.com/Vebat/sealbox/internal/envelope"
+	"github.com/Vebat/sealbox/internal/metrics"
 	"github.com/Vebat/sealbox/internal/schema"
 	"github.com/Vebat/sealbox/internal/store"
 )
@@ -183,9 +185,19 @@ func main() {
 	})
 	mux.Handle("/v1/", api.New(st, sc, clients))
 
+	var reg metrics.Registry
+	if maddr := os.Getenv("SEALBOX_METRICS_ADDR"); maddr != "" {
+		mmux := http.NewServeMux()
+		mmux.Handle("GET /metrics", reg.Handler())
+		go func() {
+			log.Printf("metrics on %s", maddr)
+			log.Fatal((&http.Server{Addr: maddr, Handler: mmux, ReadHeaderTimeout: 5 * time.Second}).ListenAndServe())
+		}()
+	}
+
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           reg.Middleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
