@@ -17,8 +17,21 @@ This is crypto-shredding, and it is the only practical way to honour an erasure 
 
 ## API
 
-Every request carries `Authorization: Bearer <SEALBOX_API_KEY>`. An object is a JSON object up to 1 MiB.
-Reads are masked unless the caller asks for `reveal=full`.
+Every request carries `Authorization: Bearer <key>`. An object is a JSON object up to 1 MiB.
+Reads are masked unless the caller asks for `reveal=full` and holds the role for it.
+
+Keys belong to named clients with explicit roles, declared in `SEALBOX_KEYS_FILE` (see [keys.example.json](keys.example.json)).
+`SEALBOX_API_KEY` adds one client named `default` with every role, for development.
+
+| Role | Allows |
+|---|---|
+| `write` | `POST` objects |
+| `read_masked` | `GET` with masks applied |
+| `read_full` | `GET ?reveal=full`, the plaintext |
+| `delete` | `DELETE`, the crypto-shred |
+
+A checkout service gets `write`. A support UI gets `read_masked`. Only the privacy tooling gets `read_full` and `delete`.
+Role is checked before the object is looked up, so an unprivileged key learns nothing about what exists.
 
 ```http
 POST /v1/collections/customers/objects
@@ -136,7 +149,7 @@ Each item is one release.
 - [x] Postgres store; delete destroys the wrapped key, with a test that proves the ciphertext is dead
 - [x] HTTP API: create, get, delete; one API key; TLS built in, plaintext only on loopback
 - [x] Collection schemas from a JSON file; email, phone, card and string types; masked reads by default
-- [ ] API key roles: write, read masked, read full
+- [x] API keys per client with roles: write, delete, read_masked, read_full
 - [ ] Blind index for exact-match search on email and phone
 - [ ] Append-only audit log of every reveal
 - [ ] Batch import and batch reveal
@@ -155,7 +168,7 @@ Each item is one release.
 
 ```
 cmd/sealbox/                entry point, config from env, TLS
-internal/api/               HTTP handlers, bearer auth, input limits
+internal/api/               HTTP handlers, clients and roles, input limits
 internal/envelope/          per-object keys wrapped under the master key
 internal/schema/            field types, validation, masks; loaded from SEALBOX_SCHEMA
 internal/store/             Postgres; delete nulls the wrapped key, the row stays

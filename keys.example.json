@@ -1,0 +1,5 @@
+{
+  "checkout": { "key": "REPLACE-WITH-openssl-rand-base64-32-A", "roles": ["write"] },
+  "support":  { "key": "REPLACE-WITH-openssl-rand-base64-32-B", "roles": ["read_masked"] },
+  "privacy":  { "key": "REPLACE-WITH-openssl-rand-base64-32-C", "roles": ["read_full", "delete"] }
+}

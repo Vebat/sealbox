@@ -1,20 +1,19 @@
 // Package api exposes the vault over HTTP.
 //
-// Every route under /v1 requires "Authorization: Bearer <key>". Request and
-// response bodies are never logged: they are the personal data this service
-// exists to hide. Reads are masked unless the caller asks for reveal=full.
+// Every route under /v1 requires "Authorization: Bearer <key>", and each key
+// belongs to a client with explicit roles. Request and response bodies are
+// never logged: they are the personal data this service exists to hide.
+// Reads are masked unless the caller asks for reveal=full and may do so.
 package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net/http"
 	"regexp"
-	"strings"
 
 	"github.com/Vebat/sealbox/internal/schema"
 	"github.com/Vebat/sealbox/internal/store"
@@ -32,14 +31,14 @@ type Vault interface {
 	Delete(ctx context.Context, collection, id string) error
 }
 
-// New returns the /v1 handler. apiKey is compared in constant time.
-func New(v Vault, s schema.Schema, apiKey []byte) http.Handler {
+// New returns the /v1 handler. clients must have passed ValidateClients.
+func New(v Vault, s schema.Schema, clients []Client) http.Handler {
 	srv := &server{vault: v, schema: s}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/collections/{collection}/objects", srv.create)
 	mux.HandleFunc("GET /v1/collections/{collection}/objects/{id}", srv.get)
 	mux.HandleFunc("DELETE /v1/collections/{collection}/objects/{id}", srv.delete)
-	return requireKey(apiKey, mux)
+	return requireKey(clients, mux)
 }
 
 type server struct {
@@ -47,18 +46,10 @@ type server struct {
 	schema schema.Schema
 }
 
-func requireKey(key []byte, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok || subtle.ConstantTimeCompare([]byte(got), key) != 1 {
-			writeError(w, http.StatusUnauthorized, "invalid API key")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func (s *server) create(w http.ResponseWriter, r *http.Request) {
+	if !require(w, r, RoleWrite) {
+		return
+	}
 	collection := r.PathValue("collection")
 	if !collectionRe.MatchString(collection) {
 		writeError(w, http.StatusBadRequest, "invalid collection name")
@@ -97,6 +88,13 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "reveal must be masked or full")
 		return
 	}
+	role := RoleReadMasked
+	if reveal == "full" {
+		role = RoleReadFull
+	}
+	if !require(w, r, role) {
+		return
+	}
 	collection := r.PathValue("collection")
 	plaintext, err := s.vault.Get(r.Context(), collection, r.PathValue("id"))
 	switch {
@@ -121,6 +119,9 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) delete(w http.ResponseWriter, r *http.Request) {
+	if !require(w, r, RoleDelete) {
+		return
+	}
 	err := s.vault.Delete(r.Context(), r.PathValue("collection"), r.PathValue("id"))
 	switch {
 	case errors.Is(err, store.ErrNotFound):

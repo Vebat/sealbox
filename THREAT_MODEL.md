@@ -24,7 +24,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 - The sealbox process is fully trusted. It holds the master key in memory.
 - The database, its backups, replicas and anyone with access to them are untrusted.
 - sealbox terminates TLS itself when given a certificate and refuses plaintext on non-loopback addresses unless explicitly told TLS is handled in front of it. Terminating TLS at an ingress that logs request bodies puts personal data in those logs; keep TLS end to end.
-- The API key is a bearer secret shared with every client. It is compared in constant time. Per-client keys with roles are on the roadmap.
+- API keys are bearer secrets, one per client, each with explicit roles. A client that only needs masked reads never holds a key that can reveal plaintext. Keys are compared in constant time. The keys file stores them in plaintext: protect it like the master key.
 
 ## Protects against
 
@@ -35,7 +35,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Ciphertext moved from one record to another | Every ciphertext is bound to its object id via AEAD associated data; it fails to open elsewhere. |
 | Erasure request while backups still exist | Delete destroys the wrapped DEK. All copies of the ciphertext become unrecoverable. |
 | Personal data in application logs, search indexes, analytics | The application never holds plaintext unless it explicitly reveals it. |
-| Bulk exfiltration through the reveal endpoint | Planned: roles that only allow masked reads, rate limits on full reveal, audit log. |
+| Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Planned: rate limits on full reveal, audit log. |
 | Nonce reuse | Random 24-byte nonces (XChaCha20) and a fresh key per object. |
 
 ## Does not protect against

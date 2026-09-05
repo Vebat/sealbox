@@ -3,7 +3,8 @@
 // Configuration is taken from the environment:
 //
 //	SEALBOX_MASTER_KEY     required, 32 random bytes base64-encoded (openssl rand -base64 32)
-//	SEALBOX_API_KEY        required, bearer token clients must present (openssl rand -base64 32)
+//	SEALBOX_KEYS_FILE      JSON file of named clients with keys and roles, see keys.example.json
+//	SEALBOX_API_KEY        one extra key holding every role, for development (openssl rand -base64 32)
 //	SEALBOX_DATABASE_URL   required, Postgres connection string; use sslmode=verify-full
 //	SEALBOX_SCHEMA         optional path to a JSON schema file, see schema.example.json
 //	SEALBOX_ADDR           listen address, default :8080
@@ -43,10 +44,20 @@ func main() {
 		log.Fatal(err)
 	}
 
-	apiKey := os.Getenv("SEALBOX_API_KEY")
-	if len(apiKey) < 16 {
-		log.Fatal("SEALBOX_API_KEY must be at least 16 characters: openssl rand -base64 32")
+	clients, err := api.LoadClients(os.Getenv("SEALBOX_KEYS_FILE"))
+	if err != nil {
+		log.Fatal(err)
 	}
+	if k := os.Getenv("SEALBOX_API_KEY"); k != "" {
+		clients = append(clients, api.Client{Name: "default", Key: k, Roles: api.AllRoles})
+	}
+	if len(clients) == 0 {
+		log.Fatal("no API keys: set SEALBOX_KEYS_FILE or SEALBOX_API_KEY")
+	}
+	if err := api.ValidateClients(clients); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("keys: %d client(s)", len(clients))
 
 	sc, err := schema.Load(os.Getenv("SEALBOX_SCHEMA"))
 	if err != nil {
@@ -88,7 +99,7 @@ func main() {
 		}
 		w.Write([]byte("ok\n"))
 	})
-	mux.Handle("/v1/", api.New(st, sc, []byte(apiKey)))
+	mux.Handle("/v1/", api.New(st, sc, clients))
 
 	srv := &http.Server{
 		Addr:              addr,
