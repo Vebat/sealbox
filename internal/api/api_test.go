@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,27 +32,33 @@ func newFakeVault() *fakeVault {
 	return &fakeVault{objects: map[string][]byte{}, indexed: map[string]map[string]string{}}
 }
 
-func (f *fakeVault) Audit(_ context.Context, e store.AuditEntry) error {
+func (f *fakeVault) AuditMany(_ context.Context, entries []store.AuditEntry) error {
 	if f.failAudit {
 		return errors.New("audit log unavailable")
 	}
-	f.audit = append(f.audit, e)
+	f.audit = append(f.audit, entries...)
 	return nil
 }
 
-func (f *fakeVault) Put(_ context.Context, collection string, plaintext []byte, indexed map[string]string) (string, error) {
-	id := "tok_" + strconv.Itoa(len(f.objects)+1)
-	f.objects[collection+"/"+id] = plaintext
-	f.indexed[collection+"/"+id] = indexed
-	return id, nil
+func (f *fakeVault) PutMany(_ context.Context, collection string, items []store.Item) ([]string, error) {
+	ids := make([]string, 0, len(items))
+	for _, it := range items {
+		id := "tok_" + strconv.Itoa(len(f.objects)+1)
+		f.objects[collection+"/"+id] = it.Plaintext
+		f.indexed[collection+"/"+id] = it.Indexed
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
-func (f *fakeVault) Get(_ context.Context, collection, id string) ([]byte, error) {
-	p, ok := f.objects[collection+"/"+id]
-	if !ok {
-		return nil, store.ErrNotFound
+func (f *fakeVault) GetMany(_ context.Context, collection string, ids []string) (map[string][]byte, error) {
+	found := map[string][]byte{}
+	for _, id := range ids {
+		if p, ok := f.objects[collection+"/"+id]; ok {
+			found[id] = p
+		}
 	}
-	return p, nil
+	return found, nil
 }
 
 func (f *fakeVault) Delete(_ context.Context, collection, id string) error {
@@ -220,6 +227,81 @@ func TestSearch(t *testing.T) {
 		}
 		if strings.Contains(body, "4510") || strings.Contains(body, "123") {
 			t.Errorf("%s: response echoes submitted data: %s", name, body)
+		}
+	}
+}
+
+func TestBatch(t *testing.T) {
+	srv, vault := newServerWithVault(t)
+	const batchPath = "/v1/collections/customers/objects/batch"
+	const revealPath = "/v1/collections/customers/objects/reveal"
+
+	// One bad object fails the whole batch, named by position, value not echoed.
+	status, body := do(t, srv, "POST", batchPath, `{"objects":[{"email":"a@example.com"},{"email":"not-an-address"}]}`, adminKey)
+	if status != http.StatusBadRequest || !strings.Contains(body, "objects[1]") || strings.Contains(body, "not-an-address") {
+		t.Fatalf("bad batch: %d %s", status, body)
+	}
+	if len(vault.objects) != 0 || len(vault.audit) != 0 {
+		t.Fatal("a rejected batch must store and log nothing")
+	}
+
+	status, body = do(t, srv, "POST", batchPath, `{"objects":[{"email":"a@example.com"},{"email":"b@example.com"},{"passport":"1"}]}`, writerKey)
+	if status != http.StatusCreated {
+		t.Fatalf("batch create: %d %s", status, body)
+	}
+	var created struct {
+		IDs []string `json:"ids"`
+	}
+	json.Unmarshal([]byte(body), &created)
+	if len(created.IDs) != 3 {
+		t.Fatalf("batch create: %s", body)
+	}
+	for i, id := range created.IDs {
+		if want := (store.AuditEntry{Client: "checkout", Action: "create", Collection: "customers", ObjectID: id}); vault.audit[i] != want {
+			t.Errorf("audit[%d] = %+v, want %+v", i, vault.audit[i], want)
+		}
+	}
+
+	// Masked reveal of two known ids, one unknown, one duplicate.
+	ids := created.IDs
+	status, body = do(t, srv, "POST", revealPath, fmt.Sprintf(`{"ids":["%s","%s","tok_nope","%s"]}`, ids[0], ids[1], ids[0]), supportKey)
+	if status != http.StatusOK {
+		t.Fatalf("batch reveal: %d %s", status, body)
+	}
+	var revealed struct {
+		Objects map[string]map[string]string `json:"objects"`
+		Missing []string                     `json:"missing"`
+	}
+	json.Unmarshal([]byte(body), &revealed)
+	if len(revealed.Objects) != 2 || revealed.Objects[ids[0]]["email"] != "a***@example.com" || !slices.Equal(revealed.Missing, []string{"tok_nope"}) {
+		t.Fatalf("batch reveal: %s", body)
+	}
+	if got := vault.audit[3:]; !slices.Equal(got, []store.AuditEntry{
+		{Client: "support", Action: "reveal_masked", Collection: "customers", ObjectID: ids[0]},
+		{Client: "support", Action: "reveal_masked", Collection: "customers", ObjectID: ids[1]},
+	}) {
+		t.Fatalf("reveal audit: %+v", got)
+	}
+
+	// Full reveal needs read_full and returns the stored object.
+	if status, _ := do(t, srv, "POST", revealPath, `{"ids":["x"],"reveal":"full"}`, supportKey); status != http.StatusForbidden {
+		t.Errorf("full reveal without role: %d", status)
+	}
+	status, body = do(t, srv, "POST", revealPath, fmt.Sprintf(`{"ids":["%s"],"reveal":"full"}`, ids[2]), privacyKey)
+	if status != http.StatusOK || !strings.Contains(body, `"passport":"1"`) {
+		t.Errorf("full reveal: %d %s", status, body)
+	}
+
+	for name, tc := range map[string]struct{ path, body string }{
+		"empty batch":      {batchPath, `{"objects":[]}`},
+		"batch not object": {batchPath, `[{"email":"a@b"}]`},
+		"too many objects": {batchPath, `{"objects":[` + strings.Repeat(`{},`, maxBatch) + `{}]}`},
+		"empty ids":        {revealPath, `{"ids":[]}`},
+		"bad reveal":       {revealPath, `{"ids":["x"],"reveal":"everything"}`},
+		"too many ids":     {revealPath, `{"ids":[` + strings.Repeat(`"x",`, maxBatch) + `"x"]}`},
+	} {
+		if status, body := do(t, srv, "POST", tc.path, tc.body, adminKey); status != http.StatusBadRequest {
+			t.Errorf("%s: expected 400, got %d %s", name, status, body)
 		}
 	}
 }

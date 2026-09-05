@@ -79,36 +79,97 @@ func (s *Store) Close() { s.pool.Close() }
 // Ping reports whether the database is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-// Put seals plaintext under a fresh key and stores it, together with a
-// blind-index entry for every indexed field (field name to normalized value).
-// The returned id is the token the caller keeps instead of the data.
+// Item is one object to store.
+type Item struct {
+	Plaintext []byte
+	Indexed   map[string]string // field name to normalized value, for the blind index
+}
+
+// Put stores one item. See PutMany.
 func (s *Store) Put(ctx context.Context, collection string, plaintext []byte, indexed map[string]string) (string, error) {
-	id := newID()
-	sealed, err := s.env.Seal(plaintext, aad(collection, id))
+	ids, err := s.PutMany(ctx, collection, []Item{{Plaintext: plaintext, Indexed: indexed}})
 	if err != nil {
 		return "", err
 	}
+	return ids[0], nil
+}
+
+// PutMany seals every item under its own fresh key and stores all of them,
+// with their blind-index entries, in one transaction: all land or none do.
+// The returned ids, in item order, are the tokens callers keep instead of
+// the data.
+func (s *Store) PutMany(ctx context.Context, collection string, items []Item) ([]string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO objects (id, collection, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4)`,
-		id, collection, sealed.WrappedDEK, sealed.Ciphertext); err != nil {
-		return "", err
-	}
-	for field, value := range indexed {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO blind_index (collection, field, hash, object_id) VALUES ($1, $2, $3, $4)`,
-			collection, field, s.env.BlindIndex(collection, field, value), id); err != nil {
-			return "", err
+	ids := make([]string, 0, len(items))
+	for _, it := range items {
+		id := newID()
+		sealed, err := s.env.Seal(it.Plaintext, aad(collection, id))
+		if err != nil {
+			return nil, err
 		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO objects (id, collection, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4)`,
+			id, collection, sealed.WrappedDEK, sealed.Ciphertext); err != nil {
+			return nil, err
+		}
+		for field, value := range it.Indexed {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO blind_index (collection, field, hash, object_id) VALUES ($1, $2, $3, $4)`,
+				collection, field, s.env.BlindIndex(collection, field, value), id); err != nil {
+				return nil, err
+			}
+		}
+		ids = append(ids, id)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return "", err
+		return nil, err
 	}
-	return id, nil
+	return ids, nil
+}
+
+// Get returns the plaintext of one live object.
+func (s *Store) Get(ctx context.Context, collection, id string) ([]byte, error) {
+	found, err := s.GetMany(ctx, collection, []string{id})
+	if err != nil {
+		return nil, err
+	}
+	plaintext, ok := found[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return plaintext, nil
+}
+
+// GetMany returns the plaintext of every live object among ids, keyed by id.
+// Ids that do not exist, were deleted, or belong to another collection are
+// absent from the result.
+func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (map[string][]byte, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, wrapped_dek, ciphertext FROM objects
+		 WHERE collection = $1 AND id = ANY($2) AND deleted_at IS NULL`,
+		collection, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	found := make(map[string][]byte, len(ids))
+	for rows.Next() {
+		var id string
+		var sealed envelope.Sealed
+		if err := rows.Scan(&id, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
+			return nil, err
+		}
+		plaintext, err := s.env.Open(sealed, aad(collection, id))
+		if err != nil {
+			return nil, err
+		}
+		found[id] = plaintext
+	}
+	return found, rows.Err()
 }
 
 // Search returns the ids of live objects whose indexed field equals the
@@ -123,22 +184,6 @@ func (s *Store) Search(ctx context.Context, collection, field, normalized string
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[string])
-}
-
-// Get returns the plaintext of a live object.
-func (s *Store) Get(ctx context.Context, collection, id string) ([]byte, error) {
-	var sealed envelope.Sealed
-	err := s.pool.QueryRow(ctx,
-		`SELECT wrapped_dek, ciphertext FROM objects
-		 WHERE id = $1 AND collection = $2 AND deleted_at IS NULL`,
-		id, collection).Scan(&sealed.WrappedDEK, &sealed.Ciphertext)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return s.env.Open(sealed, aad(collection, id))
 }
 
 // Delete shreds the object: its wrapped key is destroyed, the row is marked
@@ -177,14 +222,25 @@ type AuditEntry struct {
 	Field      string // search only
 }
 
-// Audit appends an entry. Callers log a reveal before returning data, so a
-// failed insert means no reveal.
+// Audit appends one entry. See AuditMany.
 func (s *Store) Audit(ctx context.Context, e AuditEntry) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO audit_log (client, action, collection, object_id, field)
-		 VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''))`,
-		e.Client, e.Action, e.Collection, e.ObjectID, e.Field)
-	return err
+	return s.AuditMany(ctx, []AuditEntry{e})
+}
+
+// AuditMany appends entries as one batch in one implicit transaction. Callers
+// log a reveal before returning data, so a failed insert means no reveal.
+func (s *Store) AuditMany(ctx context.Context, entries []AuditEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, e := range entries {
+		batch.Queue(
+			`INSERT INTO audit_log (client, action, collection, object_id, field)
+			 VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''))`,
+			e.Client, e.Action, e.Collection, e.ObjectID, e.Field)
+	}
+	return s.pool.SendBatch(ctx, batch).Close()
 }
 
 // aad binds a ciphertext to its row so it cannot be moved to another id or

@@ -186,6 +186,36 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+func TestPutManyGetMany(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	ids, err := s.PutMany(ctx, "customers", []Item{
+		{Plaintext: []byte(`{"n":"1"}`)},
+		{Plaintext: []byte(`{"n":"2"}`), Indexed: map[string]string{"email": "two@example.com"}},
+	})
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("got %v, %v", ids, err)
+	}
+	if err := s.Delete(ctx, "customers", ids[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	found, err := s.GetMany(ctx, "customers", []string{ids[0], ids[1], "tok_nope"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || !bytes.Equal(found[ids[1]], []byte(`{"n":"2"}`)) {
+		t.Fatalf("deleted and unknown ids must be absent: %v", found)
+	}
+	if found, _ := s.GetMany(ctx, "employees", ids); len(found) != 0 {
+		t.Fatalf("other collection: %v", found)
+	}
+	// Index entries written by the batch are live.
+	if hits, err := s.Search(ctx, "customers", "email", "two@example.com"); err != nil || !slices.Equal(hits, []string{ids[1]}) {
+		t.Fatalf("search after batch: %v, %v", hits, err)
+	}
+}
+
 func TestAudit(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
@@ -194,10 +224,8 @@ func TestAudit(t *testing.T) {
 		{Client: client, Action: "reveal_masked", Collection: "customers", ObjectID: newID()},
 		{Client: client, Action: "search", Collection: "customers", Field: "email"},
 	}
-	for _, e := range want {
-		if err := s.Audit(ctx, e); err != nil {
-			t.Fatal(err)
-		}
+	if err := s.AuditMany(ctx, want); err != nil {
+		t.Fatal(err)
 	}
 	rows, err := s.pool.Query(ctx,
 		`SELECT client, action, collection, coalesce(object_id, ''), coalesce(field, '')

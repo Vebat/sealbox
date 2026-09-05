@@ -35,7 +35,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Ciphertext moved from one record to another | Every ciphertext is bound to its object id via AEAD associated data; it fails to open elsewhere. |
 | Erasure request while backups still exist | Delete destroys the wrapped DEK. All copies of the ciphertext become unrecoverable. |
 | Personal data in application logs, search indexes, analytics | The application never holds plaintext unless it explicitly reveals it. |
-| Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Every reveal is logged before the data is returned. Planned: rate limits on full reveal. |
+| Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Every reveal is logged before the data is returned; batch reveal is capped at 1000 objects and logged per object. Planned: rate limits on full reveal. |
 | A reveal that leaves no trace | The audit entry is written first; if it fails, the request fails and nothing is returned. |
 | Nonce reuse | Random 24-byte nonces (XChaCha20) and a fresh key per object. |
 | Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a key derived from the master key with HKDF. Without the master key a dump cannot confirm a guess. |

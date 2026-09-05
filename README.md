@@ -57,6 +57,22 @@ Search takes exactly one indexed field and finds objects whose value is equal af
 It is exact match only: you can find a record by a value you already know in full, you cannot browse.
 Ranges, prefixes and free text belong in your own database, on fields that are not personal data.
 
+Lists and migrations go through batches, not one request per row:
+
+```http
+POST /v1/collections/customers/objects/batch
+{ "objects": [ { "email": "a@example.com" }, { "email": "b@example.com" } ] }
+-> 201 { "ids": ["tok_1...", "tok_2..."] }
+
+POST /v1/collections/customers/objects/reveal
+{ "ids": ["tok_1...", "tok_2...", "tok_gone"], "reveal": "masked" }
+-> 200 { "objects": { "tok_1...": { "email": "a***@example.com" }, "tok_2...": { ... } }, "missing": ["tok_gone"] }
+```
+
+A batch stores up to 1000 objects in one transaction: one invalid object fails the whole batch, named by position.
+Batch reveal returns up to 1000 objects in one call and writes one audit entry per object returned.
+Moving an existing table into sealbox is a loop of batches, replacing each row's columns with the returned id.
+
 ## Schemas
 
 A schema file, passed as `SEALBOX_SCHEMA`, declares what each collection holds. See [schema.example.json](schema.example.json):
@@ -179,7 +195,7 @@ Each item is one release.
 - [x] API keys per client with roles: write, delete, read_masked, read_full
 - [x] Blind index: exact-match search on indexed email, phone and card fields, own `search` role
 - [x] Audit log: every create, reveal, search and delete, written before the data leaves
-- [ ] Batch import and batch reveal
+- [x] Batch create, atomic up to 1000 objects, and batch reveal with per-object audit
 - [ ] OpenAPI spec and a generated client
 - [ ] Master key from a KMS, key rotation
 
