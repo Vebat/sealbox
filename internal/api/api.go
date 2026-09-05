@@ -41,7 +41,12 @@ const (
 var (
 	collectionRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 	idRe         = regexp.MustCompile(`^tok_[0-9a-f]{32}$`)
+	subjectRe    = regexp.MustCompile(`^[A-Za-z0-9._:@-]{1,128}$`)
 )
+
+// subjectKey is the reserved key that names the person an object is about.
+// It is taken out of the object before validation and storage.
+const subjectKey = "_subject"
 
 // Vault is what the API needs from storage. *store.Store satisfies it.
 // Creates and deletes carry the acting client so their audit entries commit
@@ -51,6 +56,8 @@ type Vault interface {
 	GetMany(ctx context.Context, collection string, ids []string) (map[string][]byte, error)
 	Delete(ctx context.Context, actor, collection, id string) error
 	Search(ctx context.Context, collection, field, normalized string) ([]string, error)
+	Subject(ctx context.Context, subject string) ([]store.Ref, error)
+	DeleteSubject(ctx context.Context, actor, subject string) ([]store.Ref, error)
 	AuditMany(ctx context.Context, entries []store.AuditEntry) error
 }
 
@@ -79,7 +86,53 @@ func (s *server) routes() map[string]http.HandlerFunc {
 		"GET /v1/collections/{collection}/objects/{id}":    s.get,
 		"DELETE /v1/collections/{collection}/objects/{id}": s.delete,
 		"POST /v1/collections/{collection}/search":         s.search,
+		"GET /v1/subjects/{subject}":                       s.subject,
+		"DELETE /v1/subjects/{subject}":                    s.eraseSubject,
 	}
+}
+
+// subject lists what the vault holds about one person: collections and ids,
+// no values. Role: read_masked.
+func (s *server) subject(w http.ResponseWriter, r *http.Request) {
+	if !require(w, r, RoleReadMasked) {
+		return
+	}
+	subject := r.PathValue("subject")
+	if !subjectRe.MatchString(subject) {
+		writeError(w, http.StatusBadRequest, "invalid subject")
+		return
+	}
+	refs, err := s.vault.Subject(r.Context(), subject)
+	if err != nil {
+		internalError(w, "subject", err)
+		return
+	}
+	if refs == nil {
+		refs = []store.Ref{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"objects": refs})
+}
+
+// eraseSubject shreds every object about one person in one transaction and
+// answers with what was erased. Role: delete.
+func (s *server) eraseSubject(w http.ResponseWriter, r *http.Request) {
+	if !require(w, r, RoleDelete) {
+		return
+	}
+	subject := r.PathValue("subject")
+	if !subjectRe.MatchString(subject) {
+		writeError(w, http.StatusBadRequest, "invalid subject")
+		return
+	}
+	erased, err := s.vault.DeleteSubject(r.Context(), clientFrom(r).Name, subject)
+	if err != nil {
+		internalError(w, "erase subject", err)
+		return
+	}
+	if erased == nil {
+		erased = []store.Ref{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"erased": erased})
 }
 
 func (s *server) create(w http.ResponseWriter, r *http.Request) {
@@ -314,7 +367,8 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 // parseObject checks that raw is a JSON object valid for the collection and
 // returns the item to store. What is stored is the object re-encoded: keys
 // sorted, each key once, whitespace gone. A duplicate key therefore keeps
-// only the value that was validated. Errors name a field, never a value.
+// only the value that was validated. The reserved "_subject" key is taken
+// out and kept beside the object. Errors name a field, never a value.
 func (s *server) parseObject(collection string, raw []byte) (store.Item, error) {
 	if len(raw) > maxBody {
 		return store.Item{}, errors.New("object exceeds 1 MiB")
@@ -326,6 +380,13 @@ func (s *server) parseObject(collection string, raw []byte) (store.Item, error) 
 	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
 		return store.Item{}, errors.New("must be a JSON object")
 	}
+	var subject string
+	if raw, ok := obj[subjectKey]; ok {
+		if err := json.Unmarshal(raw, &subject); err != nil || !subjectRe.MatchString(subject) {
+			return store.Item{}, fmt.Errorf("%s must be a string of up to 128 letters, digits, dots, dashes, colons or @", subjectKey)
+		}
+		delete(obj, subjectKey)
+	}
 	if err := s.schema.Validate(collection, obj); err != nil {
 		return store.Item{}, err
 	}
@@ -333,7 +394,7 @@ func (s *server) parseObject(collection string, raw []byte) (store.Item, error) 
 	if err != nil {
 		return store.Item{}, errors.New("must be a JSON object")
 	}
-	return store.Item{Plaintext: canonical, Indexed: s.schema.Indexed(collection, obj)}, nil
+	return store.Item{Plaintext: canonical, Indexed: s.schema.Indexed(collection, obj), Subject: subject}, nil
 }
 
 // render returns what a reader at this reveal level may see.

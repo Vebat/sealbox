@@ -102,6 +102,31 @@ func (c *Client) Search(ctx context.Context, collection, field, value string) ([
 	return res.IDs, err
 }
 
+// Ref names one object: its collection and id.
+type Ref struct {
+	Collection string `json:"collection"`
+	ID         string `json:"id"`
+}
+
+// Subject lists the live objects whose _subject is subject. Role: read_masked.
+func (c *Client) Subject(ctx context.Context, subject string) ([]Ref, error) {
+	var res struct {
+		Objects []Ref `json:"objects"`
+	}
+	err := c.do(ctx, "GET", "/v1/subjects/"+url.PathEscape(subject), nil, &res)
+	return res.Objects, err
+}
+
+// Erase crypto-shreds every object whose _subject is subject and returns
+// what was erased. Role: delete.
+func (c *Client) Erase(ctx context.Context, subject string) ([]Ref, error) {
+	var res struct {
+		Erased []Ref `json:"erased"`
+	}
+	err := c.do(ctx, "DELETE", "/v1/subjects/"+url.PathEscape(subject), nil, &res)
+	return res.Erased, err
+}
+
 func collectionPath(collection string) string { return "/v1/collections/" + url.PathEscape(collection) }
 
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {

@@ -149,6 +149,36 @@
         }
       }
     },
+    "/v1/subjects/{subject}": {
+      "get": {
+        "operationId": "listSubject",
+        "summary": "List what the vault holds about one person: collections and ids, no values. Role: read_masked.",
+        "parameters": [{ "$ref": "#/components/parameters/subject" }],
+        "responses": {
+          "200": {
+            "description": "Live objects whose _subject is this person.",
+            "content": { "application/json": { "schema": { "type": "object", "required": ["objects"], "properties": { "objects": { "type": "array", "items": { "$ref": "#/components/schemas/Ref" } } } } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "delete": {
+        "operationId": "eraseSubject",
+        "summary": "Erase everything about one person: crypto-shred every object whose _subject is this person, in one transaction, one audit entry each. Role: delete.",
+        "parameters": [{ "$ref": "#/components/parameters/subject" }],
+        "responses": {
+          "200": {
+            "description": "What was erased. Empty when nothing was left.",
+            "content": { "application/json": { "schema": { "type": "object", "required": ["erased"], "properties": { "erased": { "type": "array", "items": { "$ref": "#/components/schemas/Ref" } } } } } }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
     "/v1/collections/{collection}/search": {
       "post": {
         "operationId": "searchObjects",
@@ -202,6 +232,13 @@
         "in": "path",
         "required": true,
         "schema": { "$ref": "#/components/schemas/ID" }
+      },
+      "subject": {
+        "name": "subject",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string", "pattern": "^[A-Za-z0-9._:@-]{1,128}$" },
+        "description": "The person an object is about, in your own terms: a user id, a customer number. Set on an object with the reserved _subject key."
       }
     },
     "schemas": {
@@ -214,8 +251,13 @@
       "Object": {
         "type": "object",
         "additionalProperties": true,
-        "description": "Any JSON object up to 1 MiB, valid UTF-8. In a declared collection every value must be a string of the declared type and unknown fields are rejected. What is stored and returned is the object re-encoded: keys sorted, each key once (last value wins), no whitespace.",
-        "example": { "email": "ivan@example.com", "passport": "4510 123456" }
+        "description": "Any JSON object up to 1 MiB, valid UTF-8. In a declared collection every value must be a string of the declared type and unknown fields are rejected. The reserved key _subject names the person the object is about and is kept beside the object, not in it. What is stored and returned is the object re-encoded: keys sorted, each key once (last value wins), no whitespace.",
+        "example": { "_subject": "user:42", "email": "ivan@example.com", "passport": "4510 123456" }
+      },
+      "Ref": {
+        "type": "object",
+        "required": ["collection", "id"],
+        "properties": { "collection": { "type": "string" }, "id": { "$ref": "#/components/schemas/ID" } }
       },
       "MaskedObject": {
         "type": "object",

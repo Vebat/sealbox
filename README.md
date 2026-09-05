@@ -31,8 +31,10 @@ Keys belong to named clients with explicit roles, declared in `SEALBOX_KEYS_FILE
 | `write` | `POST` objects |
 | `read_masked` | `GET` with masks applied |
 | `read_full` | `GET ?reveal=full`, the plaintext |
-| `delete` | `DELETE`, the crypto-shred |
+| `delete` | `DELETE` an object, or everything about a subject |
 | `search` | `POST .../search`, ids by an indexed value |
+
+`read_masked` also lists what is held about a subject, ids only.
 
 A checkout service gets `write`. A support UI gets `read_masked`. Only the privacy tooling gets `read_full` and `delete`.
 Role is checked before the object is looked up, so an unprivileged key learns nothing about what exists.
@@ -59,6 +61,24 @@ POST /v1/collections/customers/search
 Search takes exactly one indexed field and finds objects whose value is equal after normalization, at most 100 of them.
 It is exact match only: you can find a record by a value you already know in full, you cannot browse.
 Ranges, prefixes and free text belong in your own database, on fields that are not personal data.
+
+An object can say who it is about with the reserved `_subject` key, a user id or customer number in your own
+terms. It is kept beside the object, not in it, and it is what an erasure request names:
+
+```http
+POST /v1/collections/customers/objects
+{ "_subject": "user:42", "email": "ivan@example.com" }
+
+GET /v1/subjects/user:42
+-> 200 { "objects": [ { "collection": "addresses", "id": "tok_..." }, { "collection": "customers", "id": "tok_..." } ] }
+
+DELETE /v1/subjects/user:42
+-> 200 { "erased": [ ... ] }
+```
+
+Erasing a subject crypto-shreds every object about that person across collections, in one transaction, with
+one audit entry each. The subject stays on the shredded rows, so "everything about this person was erased on this
+date" remains answerable. Use `_subject` on every object you store and a data subject request becomes one call.
 
 Lists and migrations go through batches, not one request per row:
 
@@ -325,6 +345,7 @@ Not built yet, in the order they are likely to matter:
 - [x] OpenAPI spec, served at /openapi.json and tested against the routes; Go client package
 - [x] Master key from a file or a command; rotation by re-wrapping, while serving
 - [x] Wrapping key in a key service: Vault and OpenBao transit, AWS KMS; migration by rotation
+- [x] Subjects: `_subject` on objects, list and erase everything about one person in one call
 
 ## Design rules
 

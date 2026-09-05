@@ -61,6 +61,18 @@ func TestGoClient(t *testing.T) {
 		t.Fatalf("escaped collection: %v", err)
 	}
 
+	// Everything about one person, listed and erased in one call each.
+	sid, err := c.Create(ctx, "customers", map[string]string{"_subject": "user:42", "email": "s@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := c.Subject(ctx, "user:42"); err != nil || !slices.Equal(refs, []client.Ref{{Collection: "customers", ID: sid}}) {
+		t.Fatalf("subject: %v, %v", refs, err)
+	}
+	if erased, err := c.Erase(ctx, "user:42"); err != nil || len(erased) != 1 || erased[0].ID != sid {
+		t.Fatalf("erase: %v, %v", erased, err)
+	}
+
 	if err := c.Delete(ctx, "customers", id); err != nil {
 		t.Fatal(err)
 	}

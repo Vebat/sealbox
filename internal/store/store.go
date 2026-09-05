@@ -131,6 +131,13 @@ func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 type Item struct {
 	Plaintext []byte
 	Indexed   map[string]string // field name to normalized value, for the blind index
+	Subject   string            // who the object is about, in the application's terms; optional
+}
+
+// Ref names one object.
+type Ref struct {
+	Collection string `json:"collection"`
+	ID         string `json:"id"`
 }
 
 // PutMany seals every item under its own fresh key and stores all of them,
@@ -152,8 +159,9 @@ func (s *Store) PutMany(ctx context.Context, actor, collection string, items []I
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO objects (id, collection, key_id, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4, $5)`,
-			id, collection, sealed.KeyID, sealed.WrappedDEK, sealed.Ciphertext); err != nil {
+			`INSERT INTO objects (id, collection, key_id, wrapped_dek, ciphertext, subject_id)
+			 VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))`,
+			id, collection, sealed.KeyID, sealed.WrappedDEK, sealed.Ciphertext, it.Subject); err != nil {
 			return nil, err
 		}
 		for field, value := range it.Indexed {
@@ -245,6 +253,52 @@ func (s *Store) Delete(ctx context.Context, actor, collection, id string) error 
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// Subject lists the live objects about one subject, across collections.
+func (s *Store) Subject(ctx context.Context, subject string) ([]Ref, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT collection, id FROM objects WHERE subject_id = $1 AND deleted_at IS NULL ORDER BY collection, id`,
+		subject)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[Ref])
+}
+
+// DeleteSubject shreds every live object about one subject in one
+// transaction, with one audit entry per object, and returns what was erased.
+func (s *Store) DeleteSubject(ctx context.Context, actor, subject string) ([]Ref, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx,
+		`UPDATE objects SET wrapped_dek = NULL, deleted_at = now()
+		 WHERE subject_id = $1 AND deleted_at IS NULL
+		 RETURNING collection, id`,
+		subject)
+	if err != nil {
+		return nil, err
+	}
+	erased, err := pgx.CollectRows(rows, pgx.RowToStructByPos[Ref])
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range erased {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM blind_index WHERE collection = $1 AND object_id = $2`, r.Collection, r.ID); err != nil {
+			return nil, err
+		}
+		if err := audit(ctx, tx, AuditEntry{Client: actor, Action: "delete", Collection: r.Collection, ObjectID: r.ID}); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return erased, nil
 }
 
 // Rotate re-wraps the blind-index key and every live per-object key that is

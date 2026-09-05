@@ -24,12 +24,35 @@ import (
 type fakeVault struct {
 	objects   map[string][]byte
 	indexed   map[string]map[string]string
+	subjects  map[string]string // collection/id → subject
 	audit     []store.AuditEntry
 	failAudit bool
 }
 
 func newFakeVault() *fakeVault {
-	return &fakeVault{objects: map[string][]byte{}, indexed: map[string]map[string]string{}}
+	return &fakeVault{objects: map[string][]byte{}, indexed: map[string]map[string]string{}, subjects: map[string]string{}}
+}
+
+func (f *fakeVault) Subject(_ context.Context, subject string) ([]store.Ref, error) {
+	var refs []store.Ref
+	for k, s := range f.subjects {
+		if s == subject {
+			c, id, _ := strings.Cut(k, "/")
+			refs = append(refs, store.Ref{Collection: c, ID: id})
+		}
+	}
+	slices.SortFunc(refs, func(a, b store.Ref) int { return strings.Compare(a.Collection+a.ID, b.Collection+b.ID) })
+	return refs, nil
+}
+
+func (f *fakeVault) DeleteSubject(ctx context.Context, actor, subject string) ([]store.Ref, error) {
+	refs, _ := f.Subject(ctx, subject)
+	for _, r := range refs {
+		if err := f.Delete(ctx, actor, r.Collection, r.ID); err != nil {
+			return nil, err
+		}
+	}
+	return refs, nil
 }
 
 func (f *fakeVault) AuditMany(_ context.Context, entries []store.AuditEntry) error {
@@ -49,6 +72,9 @@ func (f *fakeVault) PutMany(ctx context.Context, actor, collection string, items
 		id := "tok_" + fmt.Sprintf("%032x", len(f.objects)+1)
 		f.objects[collection+"/"+id] = it.Plaintext
 		f.indexed[collection+"/"+id] = it.Indexed
+		if it.Subject != "" {
+			f.subjects[collection+"/"+id] = it.Subject
+		}
 		f.audit = append(f.audit, store.AuditEntry{Client: actor, Action: "create", Collection: collection, ObjectID: id})
 		ids = append(ids, id)
 	}
@@ -75,6 +101,7 @@ func (f *fakeVault) Delete(_ context.Context, actor, collection, id string) erro
 	}
 	delete(f.objects, k)
 	delete(f.indexed, k)
+	delete(f.subjects, k)
 	f.audit = append(f.audit, store.AuditEntry{Client: actor, Action: "delete", Collection: collection, ObjectID: id})
 	return nil
 }
@@ -210,6 +237,55 @@ func TestStoredObjectIsCanonical(t *testing.T) {
 		if status, _ := do(t, srv, "GET", "/v1/collections/customers/objects/"+id, "", adminKey); status != http.StatusNotFound {
 			t.Errorf("id %q: expected 404, got %d", id, status)
 		}
+	}
+}
+
+func TestSubject(t *testing.T) {
+	srv, vault := newServerWithVault(t)
+	a := idOf(create(t, srv, "customers", `{"_subject":"user:42","email":"ivan@example.com"}`))
+	b := idOf(create(t, srv, "addresses", `{"_subject":"user:42","city":"x"}`))
+	create(t, srv, "customers", `{"_subject":"user:7","email":"other@example.com"}`)
+
+	// The reserved key is not part of the stored object.
+	if _, body := do(t, srv, "GET", "/v1/collections/customers/objects/"+a+"?reveal=full", "", adminKey); strings.Contains(body, "_subject") {
+		t.Fatalf("stored object carries the subject: %s", body)
+	}
+
+	status, body := do(t, srv, "GET", "/v1/subjects/user:42", "", supportKey)
+	if status != http.StatusOK || body != fmt.Sprintf(`{"objects":[{"collection":"addresses","id":"%s"},{"collection":"customers","id":"%s"}]}`, b, a) {
+		t.Fatalf("list: %d %s", status, body)
+	}
+	if status, _ := do(t, srv, "DELETE", "/v1/subjects/user:42", "", supportKey); status != http.StatusForbidden {
+		t.Errorf("erase without delete role: %d", status)
+	}
+	status, body = do(t, srv, "DELETE", "/v1/subjects/user:42", "", privacyKey)
+	if status != http.StatusOK || !strings.Contains(body, a) || !strings.Contains(body, b) {
+		t.Fatalf("erase: %d %s", status, body)
+	}
+	if status, _ := do(t, srv, "GET", "/v1/collections/customers/objects/"+a, "", adminKey); status != http.StatusNotFound {
+		t.Errorf("erased object still readable: %d", status)
+	}
+	if _, body := do(t, srv, "GET", "/v1/subjects/user:42", "", adminKey); body != `{"objects":[]}` {
+		t.Errorf("after erase: %s", body)
+	}
+	if _, body := do(t, srv, "DELETE", "/v1/subjects/user:42", "", adminKey); body != `{"erased":[]}` {
+		t.Errorf("second erase: %s", body)
+	}
+	if n := len(vault.subjects); n != 1 {
+		t.Errorf("the other subject must survive: %d left", n)
+	}
+
+	for name, body := range map[string]string{
+		"not a string": `{"_subject":42}`,
+		"bad chars":    `{"_subject":"a b"}`,
+		"too long":     `{"_subject":"` + strings.Repeat("x", 129) + `"}`,
+	} {
+		if status, _ := do(t, srv, "POST", "/v1/collections/customers/objects", body, adminKey); status != http.StatusBadRequest {
+			t.Errorf("%s: %d", name, status)
+		}
+	}
+	if status, _ := do(t, srv, "GET", "/v1/subjects/a%20b", "", adminKey); status != http.StatusBadRequest {
+		t.Errorf("invalid subject in path: %d", status)
 	}
 }
 
@@ -412,6 +488,12 @@ func TestRoles(t *testing.T) {
 		{"privacy", privacyKey, "GET", path + "?reveal=full", http.StatusOK},
 		{"privacy", privacyKey, "DELETE", nowhere, http.StatusNotFound},
 		{"privacy", privacyKey, "DELETE", path, http.StatusNoContent},
+
+		{"checkout", writerKey, "GET", "/v1/subjects/u1", http.StatusForbidden},
+		{"checkout", writerKey, "DELETE", "/v1/subjects/u1", http.StatusForbidden},
+		{"support", supportKey, "GET", "/v1/subjects/u1", http.StatusOK},
+		{"support", supportKey, "DELETE", "/v1/subjects/u1", http.StatusForbidden},
+		{"privacy", privacyKey, "DELETE", "/v1/subjects/u1", http.StatusOK},
 	} {
 		status, body := do(t, srv, tc.method, tc.path, object, tc.key)
 		if status != tc.want {

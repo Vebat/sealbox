@@ -503,6 +503,54 @@ func TestRotateInPlace(t *testing.T) {
 	}
 }
 
+func TestSubject(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	subject := "user-" + newID()[4:12]
+	email := uniqueEmail()
+	ids, err := s.PutMany(ctx, actor, "customers", []Item{
+		{Plaintext: []byte(`{"n":"1"}`), Subject: subject, Indexed: map[string]string{"email": email}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := mustPut(t, s, "addresses", `{"n":"2"}`, nil)
+	if _, err := s.pool.Exec(ctx, `UPDATE objects SET subject_id = $1 WHERE id = $2`, subject, address); err != nil {
+		t.Fatal(err)
+	}
+	other := mustPut(t, s, "customers", `{"n":"3"}`, nil)
+
+	want := []Ref{{"addresses", address}, {"customers", ids[0]}}
+	if got, err := s.Subject(ctx, subject); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("subject objects: %v, %v", got, err)
+	}
+
+	erased, err := s.DeleteSubject(ctx, actor, subject)
+	if err != nil || !slices.Equal(erased, want) {
+		t.Fatalf("erase: %v, %v", erased, err)
+	}
+	for _, r := range want {
+		if _, err := get(s, r.Collection, r.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("%s/%s still readable: %v", r.Collection, r.ID, err)
+		}
+		if got := auditActions(t, s, r.ID); got[len(got)-1] != "delete" {
+			t.Errorf("%s/%s: audit %v", r.Collection, r.ID, got)
+		}
+	}
+	if hits, _ := s.Search(ctx, "customers", "email", email); len(hits) != 0 {
+		t.Errorf("index entries must go with the objects: %v", hits)
+	}
+	if _, err := get(s, "customers", other); err != nil {
+		t.Errorf("an unrelated object must survive: %v", err)
+	}
+	if got, err := s.Subject(ctx, subject); err != nil || len(got) != 0 {
+		t.Errorf("after erase: %v, %v", got, err)
+	}
+	if again, err := s.DeleteSubject(ctx, actor, subject); err != nil || len(again) != 0 {
+		t.Errorf("second erase must find nothing: %v, %v", again, err)
+	}
+}
+
 func TestAuditMany(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
