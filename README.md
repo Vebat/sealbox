@@ -36,6 +36,11 @@ Keys belong to named clients with explicit roles, declared in `SEALBOX_KEYS_FILE
 
 `read_masked` also lists what is held about a subject, ids only.
 
+Each client has a reveal budget, `reveal_per_second` in the keys file, default 200 with a burst of five seconds'
+worth. Full reveals spend one unit per object, batch or not, and searches spend one each; over budget the
+answer is 429 and nothing is revealed. Masked reads are free. Give a support desk 20 and a payment worker what
+it measurably needs: the budget is what turns a stolen key into a slow leak instead of a dump.
+
 A checkout service gets `write`. A support UI gets `read_masked`. Only the privacy tooling gets `read_full` and `delete`.
 Role is checked before the object is looked up, so an unprivileged key learns nothing about what exists.
 
@@ -326,7 +331,6 @@ SEALBOX_DATABASE_URL=postgres://user:pass@localhost:5432/sealbox SEALBOX_ADDR=12
 
 Not built yet, in the order they are likely to matter:
 
-- Rate limits on full reveal and search
 - A separate database role for migrations, so the runtime user can only insert into the audit log
 - Signed releases and an SBOM
 - Re-indexing existing objects when a field gains `index: true`
@@ -346,6 +350,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Master key from a file or a command; rotation by re-wrapping, while serving
 - [x] Wrapping key in a key service: Vault and OpenBao transit, AWS KMS; migration by rotation
 - [x] Subjects: `_subject` on objects, list and erase everything about one person in one call
+- [x] Per-client reveal budget: full reveals and searches rate-limited, masked reads free
 
 ## Design rules
 
@@ -377,6 +382,7 @@ carries a license outside Apache-2.0, BSD, MIT or ISC.
 | golang.org/x/crypto | BSD-3-Clause | XChaCha20-Poly1305 |
 | github.com/jackc/pgx/v5 | MIT | Postgres driver |
 | github.com/jackc/tern/v2 | MIT | SQL migrations with an advisory lock |
+| golang.org/x/time | BSD-3-Clause | per-client rate limiting |
 
 The full transitive list: `go run github.com/google/go-licenses@v1.6.0 report ./...`.
 Builds with `-tags awskms` add the AWS SDK for Go v2, Apache-2.0, and its modules.

@@ -24,6 +24,7 @@ func TestParseClients(t *testing.T) {
 		"no roles":      `{"a": {"key": "0123456789abcdef", "roles": []}}`,
 		"duplicate key": `{"a": {"key": "0123456789abcdef", "roles": ["write"]}, "b": {"key": "0123456789abcdef", "roles": ["write"]}}`,
 		"unknown field": `{"a": {"key": "0123456789abcdef", "roles": ["write"], "admin": true}}`,
+		"negative rate": `{"a": {"key": "0123456789abcdef", "roles": ["write"], "reveal_per_second": -1}}`,
 		"not json":      `nope`,
 	} {
 		if _, err := ParseClients([]byte(doc)); err == nil {

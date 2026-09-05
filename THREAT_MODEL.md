@@ -36,7 +36,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Ciphertext moved from one record to another | Every ciphertext is bound to its object id via AEAD associated data; it fails to open elsewhere. |
 | Erasure request against the live database, replicas and later backups | Delete destroys the wrapped DEK. The ciphertext cannot be opened from this database or from any backup taken after the delete. |
 | Personal data in application logs, search indexes, analytics | The application never holds plaintext unless it explicitly reveals it. |
-| Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Every reveal is logged before the data is returned; batch reveal is capped at 1000 objects and logged per object. Planned: rate limits on full reveal. |
+| Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Every reveal is logged before the data is returned; batch reveal is capped at 1000 objects and logged per object. Each client has a reveal budget: full reveals, per object, and searches beyond it are refused with 429. |
 | A reveal that leaves no trace | The audit entry is written first; if it fails, the request fails and nothing is returned. Creates and deletes commit with their entry in one transaction. |
 | Nonce reuse | Random 24-byte nonces (XChaCha20) and a fresh key per object. |
 | Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a random index key that is stored wrapped by the master key. Without the master key a dump cannot confirm a guess. |
@@ -59,7 +59,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | A malicious or buggy sealbox build | Verify releases. Signed builds and an SBOM are on the roadmap; a third-party audit has not happened. |
 | Traffic analysis | Object sizes and access patterns are visible to the database and the network. |
 | Equality leaking through the blind index | A dump shows which records share an indexed value, not what it is. Hashes are separated per collection and field, so the same value in two fields does not link them. Index only what you must search. |
-| Membership probing through search | Search confirms whether a value you already hold exists. It needs the `search` role and is logged; rate limits are planned. |
+| Membership probing through search | Search confirms whether a value you already hold exists. It needs the `search` role, is logged, and spends the client's reveal budget, so probing a list of phone numbers runs at the budget's pace and shows in the log. |
 | Tampering with the audit log by whoever holds the database credentials | sealbox only inserts, but its database user owns the table. A separate migration role and external log shipping are planned. |
 | Side channels on shared hardware | Out of scope. |
 

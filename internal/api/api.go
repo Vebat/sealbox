@@ -18,7 +18,10 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"time"
 	"unicode/utf8"
+
+	"golang.org/x/time/rate"
 
 	"github.com/Vebat/sealbox/internal/schema"
 	"github.com/Vebat/sealbox/internal/store"
@@ -63,7 +66,11 @@ type Vault interface {
 
 // New returns the /v1 handler. clients must have passed ValidateClients.
 func New(v Vault, s schema.Schema, clients []Client) http.Handler {
-	srv := &server{vault: v, schema: s}
+	srv := &server{vault: v, schema: s, limiters: map[string]*rate.Limiter{}}
+	for _, c := range clients {
+		per := cmp.Or(c.RevealPerSecond, defaultRevealPerSecond)
+		srv.limiters[c.Name] = rate.NewLimiter(rate.Limit(per), int(per*5))
+	}
 	mux := http.NewServeMux()
 	for pattern, handle := range srv.routes() {
 		mux.HandleFunc(pattern, handle)
@@ -72,8 +79,20 @@ func New(v Vault, s schema.Schema, clients []Client) http.Handler {
 }
 
 type server struct {
-	vault  Vault
-	schema schema.Schema
+	vault    Vault
+	schema   schema.Schema
+	limiters map[string]*rate.Limiter // per client, for full reveals and searches
+}
+
+// allow spends n units of the caller's reveal budget, answering 429 and
+// returning false when they are not there. Masked reads are free: they hand
+// out nothing an attacker wants in bulk.
+func (s *server) allow(w http.ResponseWriter, r *http.Request, n int) bool {
+	if l := s.limiters[clientFrom(r).Name]; l != nil && !l.AllowN(time.Now(), n) {
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return false
+	}
+	return true
 }
 
 // routes maps mux patterns to handlers. openapi.json must document exactly
@@ -213,6 +232,9 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	if !require(w, r, revealRole(reveal)) {
 		return
 	}
+	if reveal == "full" && !s.allow(w, r, 1) {
+		return
+	}
 	collection, id := r.PathValue("collection"), r.PathValue("id")
 	if !idRe.MatchString(id) {
 		writeError(w, http.StatusNotFound, "object not found")
@@ -277,6 +299,9 @@ func (s *server) revealBatch(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "reveal batch", err)
 		return
 	}
+	if req.Reveal == "full" && !s.allow(w, r, len(found)) {
+		return
+	}
 	objects := make(map[string]any, len(found))
 	missing := []string{}
 	seen := map[string]bool{}
@@ -330,7 +355,7 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 // search answers {"ids": [...]} for a body of exactly one indexed field and
 // its value. It confirms whether a known value exists, so it has its own role.
 func (s *server) search(w http.ResponseWriter, r *http.Request) {
-	if !require(w, r, RoleSearch) {
+	if !require(w, r, RoleSearch) || !s.allow(w, r, 1) {
 		return
 	}
 	collection := r.PathValue("collection")

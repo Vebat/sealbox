@@ -1,5 +1,5 @@
 {
   "checkout": { "key": "REPLACE-ME", "roles": ["write"] },
-  "support":  { "key": "REPLACE-ME", "roles": ["read_masked", "search"] },
-  "privacy":  { "key": "REPLACE-ME", "roles": ["read_full", "delete"] }
+  "support":  { "key": "REPLACE-ME", "roles": ["read_masked", "search"], "reveal_per_second": 20 },
+  "privacy":  { "key": "REPLACE-ME", "roles": ["read_full", "delete"], "reveal_per_second": 50 }
 }

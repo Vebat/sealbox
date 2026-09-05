@@ -121,6 +121,7 @@ const (
 	writerKey  = "writer-key-0123456789abcdef"
 	supportKey = "support-key-0123456789abcdef"
 	privacyKey = "privacy-key-0123456789abcdef"
+	slowKey    = "slow-key-0123456789abcdef"
 )
 
 var testClients = []Client{
@@ -128,6 +129,7 @@ var testClients = []Client{
 	{Name: "checkout", Key: writerKey, Roles: []string{RoleWrite}},
 	{Name: "support", Key: supportKey, Roles: []string{RoleReadMasked, RoleSearch}},
 	{Name: "privacy", Key: privacyKey, Roles: []string{RoleReadFull, RoleDelete}},
+	{Name: "slow", Key: slowKey, Roles: AllRoles, RevealPerSecond: 2},
 }
 
 const testSchema = `{"customers": {"fields": {
@@ -237,6 +239,50 @@ func TestStoredObjectIsCanonical(t *testing.T) {
 		if status, _ := do(t, srv, "GET", "/v1/collections/customers/objects/"+id, "", adminKey); status != http.StatusNotFound {
 			t.Errorf("id %q: expected 404, got %d", id, status)
 		}
+	}
+}
+
+func TestRateLimit(t *testing.T) {
+	srv := newServer(t)
+	path := create(t, srv, "customers", `{"email":"ivan@example.com"}`)
+	// "slow" may reveal 2 per second with a burst of 10.
+	count := func(method, p, body string) (limited int) {
+		for range 12 {
+			if status, _ := do(t, srv, method, p, body, slowKey); status == http.StatusTooManyRequests {
+				limited++
+			}
+		}
+		return limited
+	}
+	if n := count("GET", path+"?reveal=full", ""); n == 0 {
+		t.Error("full reveals: expected the burst to run out")
+	}
+	if n := count("GET", path, ""); n != 0 {
+		t.Errorf("masked reads must not be limited, %d refused", n)
+	}
+	if status, _ := do(t, srv, "GET", path+"?reveal=full", "", adminKey); status != http.StatusOK {
+		t.Errorf("another client must be unaffected: %d", status)
+	}
+
+	srv = newServer(t)
+	create(t, srv, "customers", `{"email":"ivan@example.com"}`)
+	if n := count("POST", "/v1/collections/customers/search", `{"email":"ivan@example.com"}`); n == 0 {
+		t.Error("searches: expected the burst to run out")
+	}
+
+	// A batch full reveal spends one unit per object returned and is refused whole.
+	srv = newServer(t)
+	var ids []string
+	for range 11 {
+		ids = append(ids, idOf(create(t, srv, "customers", `{"email":"a@example.com"}`)))
+	}
+	body, _ := json.Marshal(map[string]any{"ids": ids, "reveal": "full"})
+	if status, resp := do(t, srv, "POST", "/v1/collections/customers/objects/reveal", string(body), slowKey); status != http.StatusTooManyRequests || strings.Contains(resp, "example.com") {
+		t.Errorf("batch over budget: %d %s", status, resp)
+	}
+	body, _ = json.Marshal(map[string]any{"ids": ids, "reveal": "masked"})
+	if status, _ := do(t, srv, "POST", "/v1/collections/customers/objects/reveal", string(body), slowKey); status != http.StatusOK {
+		t.Errorf("masked batch must not be limited: %d", status)
 	}
 }
 

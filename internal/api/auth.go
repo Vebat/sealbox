@@ -29,12 +29,18 @@ var AllRoles = []string{RoleWrite, RoleDelete, RoleReadMasked, RoleReadFull, Rol
 
 const minKeyLen = 16
 
-// Client is one holder of an API key.
+// Client is one holder of an API key. RevealPerSecond caps what hands out
+// plaintext or confirms existence: full reveals, counted per object, and
+// searches. 0 means the default. The burst is five seconds' worth, so a
+// batch reveal of a thousand objects still fits under the default.
 type Client struct {
-	Name  string   `json:"-"`
-	Key   string   `json:"key"`
-	Roles []string `json:"roles"`
+	Name            string   `json:"-"`
+	Key             string   `json:"key"`
+	Roles           []string `json:"roles"`
+	RevealPerSecond float64  `json:"reveal_per_second"`
 }
+
+const defaultRevealPerSecond = 200
 
 func (c Client) has(role string) bool { return slices.Contains(c.Roles, role) }
 
@@ -98,6 +104,9 @@ func ValidateClients(clients []Client) error {
 			if !slices.Contains(AllRoles, r) {
 				return fmt.Errorf("keys: %s: unknown role %q", c.Name, r)
 			}
+		}
+		if c.RevealPerSecond < 0 {
+			return fmt.Errorf("keys: %s: negative reveal_per_second", c.Name)
 		}
 	}
 	return nil
