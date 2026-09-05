@@ -13,7 +13,10 @@ services:
     build: .
     environment:
       SEALBOX_MASTER_KEY: ${SEALBOX_MASTER_KEY:?set it in .env, see .env.example}
+      SEALBOX_API_KEY: ${SEALBOX_API_KEY:?set it in .env, see .env.example}
       SEALBOX_DATABASE_URL: postgres://sealbox:sealbox@postgres:5432/sealbox?sslmode=disable
+      # Dev only: plaintext HTTP inside the compose network. Production needs SEALBOX_TLS_CERT/KEY.
+      SEALBOX_INSECURE_HTTP: "1"
     ports: ["8080:8080"]
     depends_on: [postgres]
 

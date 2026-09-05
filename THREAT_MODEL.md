@@ -23,7 +23,8 @@ If a claim in the README is not backed by a line here, the README is wrong.
 - The application is trusted with whatever it is allowed to reveal, and nothing more.
 - The sealbox process is fully trusted. It holds the master key in memory.
 - The database, its backups, replicas and anyone with access to them are untrusted.
-- The network between application and sealbox must be TLS or a private network. sealbox does not terminate TLS itself in the first releases.
+- sealbox terminates TLS itself when given a certificate and refuses plaintext on non-loopback addresses unless explicitly told TLS is handled in front of it. Terminating TLS at an ingress that logs request bodies puts personal data in those logs; keep TLS end to end.
+- The API key is a bearer secret shared with every client. It is compared in constant time. Per-client keys with roles are on the roadmap.
 
 ## Protects against
 

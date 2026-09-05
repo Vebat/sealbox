@@ -15,23 +15,40 @@ ciphertext, encrypted under a key that exists only for that one object. Deleting
 so every copy of the ciphertext in every backup and replica becomes unreadable at the same moment.
 This is crypto-shredding, and it is the only practical way to honour an erasure request when backups outlive it.
 
-## How it will look
+## API
+
+Every request carries `Authorization: Bearer <SEALBOX_API_KEY>`. An object is any JSON object up to 1 MiB.
 
 ```http
 POST /v1/collections/customers/objects
 { "email": "ivan@example.com", "passport": "4510 123456" }
--> { "id": "tok_9f3a..." }
+-> 201 { "id": "tok_9f3a..." }
 
-GET /v1/collections/customers/objects/tok_9f3a?reveal=masked
+GET /v1/collections/customers/objects/tok_9f3a...
+-> 200 { "email": "ivan@example.com", "passport": "4510 123456" }
+
+DELETE /v1/collections/customers/objects/tok_9f3a...
+-> 204, the object's key is destroyed; its ciphertext is now noise
+```
+
+Planned, not built yet:
+
+```http
+GET /v1/collections/customers/objects/tok_9f3a...?reveal=masked
 -> { "email": "i***@example.com", "passport": "45** ******" }
 
 POST /v1/collections/customers/search
 { "email": "ivan@example.com" }
 -> { "ids": ["tok_9f3a..."] }
-
-DELETE /v1/collections/customers/objects/tok_9f3a
--> the object's key is destroyed; its ciphertext is now noise
 ```
+
+## Transport
+
+sealbox terminates TLS itself: set `SEALBOX_TLS_CERT` and `SEALBOX_TLS_KEY`. Without them it refuses to listen on
+anything but a loopback address, unless `SEALBOX_INSECURE_HTTP=1` says TLS is terminated in front of it. Think
+before doing that: whatever terminates TLS sees personal data in request bodies, and most ingresses log bodies on error.
+
+Connect to Postgres with `sslmode=verify-full`. sealbox warns at startup when it sees `sslmode=disable`.
 
 ## What it protects against
 
@@ -56,15 +73,25 @@ that decrypts a value and leaks it itself. Read [THREAT_MODEL.md](THREAT_MODEL.m
 ## Quickstart
 
 ```sh
-echo "SEALBOX_MASTER_KEY=$(openssl rand -base64 32)" > .env
+printf 'SEALBOX_MASTER_KEY=%s\nSEALBOX_API_KEY=%s\n' "$(openssl rand -base64 32)" "$(openssl rand -base64 32)" > .env
 docker compose up --build
-curl localhost:8080/healthz
 ```
 
-Or without Docker:
+Then, in another shell:
 
 ```sh
-SEALBOX_MASTER_KEY=$(openssl rand -base64 32) go run ./cmd/sealbox
+export KEY=$(sed -n 's/^SEALBOX_API_KEY=//p' .env)
+curl -s -H "Authorization: Bearer $KEY" -d '{"email":"ivan@example.com"}' localhost:8080/v1/collections/customers/objects
+# {"id":"tok_..."}
+curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/collections/customers/objects/tok_...
+curl -s -X DELETE -H "Authorization: Bearer $KEY" localhost:8080/v1/collections/customers/objects/tok_...
+```
+
+Or without Docker, against your own Postgres:
+
+```sh
+SEALBOX_MASTER_KEY=$(openssl rand -base64 32) SEALBOX_API_KEY=$(openssl rand -base64 32) \
+SEALBOX_DATABASE_URL=postgres://user:pass@localhost:5432/sealbox SEALBOX_ADDR=127.0.0.1:8080 go run ./cmd/sealbox
 ```
 
 ## Roadmap
@@ -72,8 +99,8 @@ SEALBOX_MASTER_KEY=$(openssl rand -base64 32) go run ./cmd/sealbox
 Each item is one release.
 
 - [x] Envelope encryption: XChaCha20-Poly1305, fresh key per object, ciphertext bound to the object id
-- [ ] Postgres store; delete destroys the wrapped key, with a test that proves the ciphertext is dead
-- [ ] HTTP API: create, get, delete; one API key
+- [x] Postgres store; delete destroys the wrapped key, with a test that proves the ciphertext is dead
+- [x] HTTP API: create, get, delete; one API key; TLS built in, plaintext only on loopback
 - [ ] Collection schemas, field types, masks
 - [ ] API key roles: write, read masked, read full
 - [ ] Blind index for exact-match search on email and phone
@@ -93,9 +120,34 @@ Each item is one release.
 ## Layout
 
 ```
-cmd/sealbox/         entry point, config from env
-internal/envelope/   per-object keys wrapped under the master key
+cmd/sealbox/                entry point, config from env, TLS
+internal/api/               HTTP handlers, bearer auth, input limits
+internal/envelope/          per-object keys wrapped under the master key
+internal/store/             Postgres; delete nulls the wrapped key, the row stays
+internal/store/migrations/  numbered SQL files, applied once each at startup
 ```
+
+## Dependencies
+
+Direct runtime dependencies, all under permissive licenses. CI fails if any dependency, direct or transitive,
+carries a license outside Apache-2.0, BSD, MIT or ISC.
+
+| Module | License | Used for |
+|---|---|---|
+| golang.org/x/crypto | BSD-3-Clause | XChaCha20-Poly1305 |
+| github.com/jackc/pgx/v5 | MIT | Postgres driver |
+| github.com/jackc/tern/v2 | MIT | SQL migrations with an advisory lock |
+
+The full transitive list: `go run github.com/google/go-licenses@v1.6.0 report ./...`.
+
+## Development
+
+```sh
+docker compose up -d postgres
+SEALBOX_TEST_DATABASE_URL=postgres://sealbox:sealbox@localhost:5432/sealbox?sslmode=disable go test -race ./...
+```
+
+Store tests are skipped when `SEALBOX_TEST_DATABASE_URL` is not set. CI runs them against a Postgres service.
 
 ## License
 
