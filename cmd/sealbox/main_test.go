@@ -48,6 +48,18 @@ func randomKeyB64(t *testing.T) (string, []byte) {
 	return base64.StdEncoding.EncodeToString(k), k
 }
 
+func TestLoadCA(t *testing.T) {
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty.pem")
+	os.WriteFile(empty, []byte("not a certificate"), 0o600)
+	if _, err := loadCA(empty); err == nil {
+		t.Error("a file without certificates must be refused")
+	}
+	if _, err := loadCA(filepath.Join(dir, "missing.pem")); err == nil {
+		t.Error("a missing file must be refused")
+	}
+}
+
 func TestLoadMasterKeys(t *testing.T) {
 	b1, k1 := randomKeyB64(t)
 	b2, k2 := randomKeyB64(t)

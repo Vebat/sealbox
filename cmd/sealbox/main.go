@@ -38,7 +38,9 @@
 //	SEALBOX_ADDR           listen address, default :8080
 //	SEALBOX_TLS_CERT       PEM certificate; together with SEALBOX_TLS_KEY enables TLS
 //	SEALBOX_TLS_KEY        PEM private key
+//	SEALBOX_TLS_CLIENT_CA  PEM CA bundle; when set, clients must present a certificate it signed
 //	SEALBOX_INSECURE_HTTP  "1" allows plaintext HTTP on a non-loopback address
+//	SEALBOX_AUDIT_STDOUT   "1" also writes every audit entry to stdout as JSON, for shipping off the host
 //
 // Without a certificate the server only listens on loopback addresses, unless
 // SEALBOX_INSECURE_HTTP=1 states that TLS is terminated by something in front
@@ -49,10 +51,13 @@ package main
 import (
 	"cmp"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -67,6 +72,9 @@ import (
 )
 
 func main() {
+	if err := harden(); err != nil {
+		log.Printf("warning: %v", err)
+	}
 	ctx := context.Background()
 	wrappers, err := loadWrappers(ctx)
 	if err != nil {
@@ -128,11 +136,14 @@ func main() {
 	if addr == "" {
 		addr = ":8080"
 	}
-	cert, key := os.Getenv("SEALBOX_TLS_CERT"), os.Getenv("SEALBOX_TLS_KEY")
+	cert, key, clientCA := os.Getenv("SEALBOX_TLS_CERT"), os.Getenv("SEALBOX_TLS_KEY"), os.Getenv("SEALBOX_TLS_CLIENT_CA")
 	if (cert == "") != (key == "") {
 		log.Fatal("set both SEALBOX_TLS_CERT and SEALBOX_TLS_KEY, or neither")
 	}
 	useTLS := cert != ""
+	if !useTLS && clientCA != "" {
+		log.Fatal("SEALBOX_TLS_CLIENT_CA needs SEALBOX_TLS_CERT and SEALBOX_TLS_KEY")
+	}
 	if !useTLS && !isLoopback(addr) && os.Getenv("SEALBOX_INSECURE_HTTP") != "1" {
 		log.Fatalf("refusing plaintext HTTP on %s: set SEALBOX_TLS_CERT and SEALBOX_TLS_KEY, or SEALBOX_INSECURE_HTTP=1 if TLS is terminated in front of sealbox", addr)
 	}
@@ -144,6 +155,9 @@ func main() {
 		log.Fatal(err)
 	}
 	defer st.Close()
+	if os.Getenv("SEALBOX_AUDIT_STDOUT") == "1" {
+		st.AuditTo(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -166,12 +180,36 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 	}
-	if useTLS {
-		log.Printf("sealbox listening on %s (TLS)", addr)
-		log.Fatal(srv.ListenAndServeTLS(cert, key))
+	if !useTLS {
+		log.Printf("sealbox listening on %s (plaintext HTTP)", addr)
+		log.Fatal(srv.ListenAndServe())
 	}
-	log.Printf("sealbox listening on %s (plaintext HTTP)", addr)
-	log.Fatal(srv.ListenAndServe())
+	srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+	if clientCA != "" {
+		pool, err := loadCA(clientCA)
+		if err != nil {
+			log.Fatal(err)
+		}
+		srv.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		srv.TLSConfig.ClientCAs = pool
+		log.Printf("sealbox listening on %s (TLS, client certificates required)", addr)
+	} else {
+		log.Printf("sealbox listening on %s (TLS)", addr)
+	}
+	log.Fatal(srv.ListenAndServeTLS(cert, key))
+}
+
+// loadCA reads a PEM bundle into a pool for verifying client certificates.
+func loadCA(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, errors.New("SEALBOX_TLS_CLIENT_CA: no certificates found")
+	}
+	return pool, nil
 }
 
 // migrateAndGrant applies pending migrations and, when SEALBOX_RUNTIME_ROLE

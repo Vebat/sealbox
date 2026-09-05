@@ -25,7 +25,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 - The sealbox process is fully trusted. It holds the master key in memory.
 - The database, its backups, replicas and anyone with access to them are untrusted.
 - sealbox terminates TLS itself when given a certificate and refuses plaintext on non-loopback addresses unless explicitly told TLS is handled in front of it. Terminating TLS at an ingress that logs request bodies puts personal data in those logs; keep TLS end to end.
-- API keys are bearer secrets, one per client, each with explicit roles. A client that only needs masked reads never holds a key that can reveal plaintext. Keys are compared in constant time. The keys file stores them in plaintext: protect it like the master key.
+- API keys are bearer secrets, one per client, each with explicit roles. A client that only needs masked reads never holds a key that can reveal plaintext. Keys are compared in constant time. The keys file stores them in plaintext: protect it like the master key. With `SEALBOX_TLS_CLIENT_CA` a stolen key is useless without a client certificate as well.
 
 ## Protects against
 
@@ -61,7 +61,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Traffic analysis | Object sizes and access patterns are visible to the database and the network. |
 | Equality leaking through the blind index | A dump shows which records share an indexed value, not what it is. Hashes are separated per collection and field, so the same value in two fields does not link them. Index only what you must search. |
 | Membership probing through search | Search confirms whether a value you already hold exists. It needs the `search` role, is logged, and spends the client's reveal budget, so probing a list of phone numbers runs at the budget's pace and shows in the log. |
-| Tampering with the audit log by whoever holds the owner credentials | With two roles the servers can only append; the owner role that runs migrations can still rewrite the log. Ship it off the box if that matters. |
+| Tampering with the audit log by whoever holds the owner credentials | With two roles the servers can only append; the owner role that runs migrations can still rewrite the log. `SEALBOX_AUDIT_STDOUT=1` sends a copy of every entry to stdout for shipping elsewhere. |
 | Side channels on shared hardware | Out of scope. |
 
 ## Assumptions

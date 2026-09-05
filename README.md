@@ -274,7 +274,9 @@ SEALBOX_DATABASE_URL=postgres://sealbox_owner:...@db/sealbox SEALBOX_RUNTIME_ROL
 write objects and keys, add and remove index rows, and append to the audit log, which it cannot update, delete or
 truncate. Run the servers as `sealbox_app` with `SEALBOX_MIGRATE=off`; they check that the schema is current and
 refuse to start otherwise. Repeat `sealbox migrate` on every upgrade. Whoever holds the owner credentials can still
-rewrite the log, so ship it off the box as well if you need tamper evidence against your own administrators.
+rewrite the log, so ship it off the box as well if you need tamper evidence against your own administrators:
+`SEALBOX_AUDIT_STDOUT=1` writes every committed entry to stdout as one JSON line, for whatever collects container
+output. Never a value, only client, action, collection, object id and, for searches, the field.
 
 ## Transport
 
@@ -284,7 +286,13 @@ before doing that: whatever terminates TLS sees personal data in request bodies,
 
 Connect to Postgres with `sslmode=verify-full`. sealbox warns at startup when it sees `sslmode=disable`.
 
+With `SEALBOX_TLS_CLIENT_CA` set to a PEM bundle, only clients presenting a certificate signed by it get a TLS
+session at all; API keys still say who they are. TLS is 1.3 only.
+
 Two endpoints need no key: `GET /healthz`, which pings the database, and `GET /openapi.json`.
+
+On Linux sealbox disables core dumps and marks itself non-dumpable at start, so a crash or a debugger of the same
+user does not write key material to disk.
 
 The container image is distroless and runs as uid 65532. Mounted files, the schema, a keys file, TLS certificate and key,
 must be readable by that user.
@@ -365,6 +373,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Subjects: `_subject` on objects, list and erase everything about one person in one call
 - [x] Per-client reveal budget: full reveals and searches rate-limited, masked reads free
 - [x] Two database roles: `sealbox migrate` with the owner, servers with a role whose audit log is append-only
+- [x] Hardening: audit entries to stdout for shipping, no core dumps on Linux, client certificates for the API
 
 ## Design rules
 

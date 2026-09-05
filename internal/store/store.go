@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -47,9 +48,25 @@ var indexKeyAAD = []byte("keys\x00" + indexKeyName)
 
 // Store seals values before they reach Postgres and opens them after.
 type Store struct {
-	pool  *pgxpool.Pool
-	env   *envelope.Envelope
-	index *envelope.Index
+	pool     *pgxpool.Pool
+	env      *envelope.Envelope
+	index    *envelope.Index
+	auditLog *slog.Logger // optional copy of every audit entry, for shipping off the host
+}
+
+// AuditTo makes the store also write every committed audit entry to l, one
+// record each, so the log can be shipped somewhere the database's own
+// administrators cannot rewrite it.
+func (s *Store) AuditTo(l *slog.Logger) { s.auditLog = l }
+
+// emit copies committed entries to the audit logger, if any.
+func (s *Store) emit(entries ...AuditEntry) {
+	if s.auditLog == nil {
+		return
+	}
+	for _, e := range entries {
+		s.auditLog.Info("audit", "client", e.Client, "action", e.Action, "collection", e.Collection, "object_id", e.ObjectID, "field", e.Field)
+	}
 }
 
 // Open connects to databaseURL and loads the blind-index key, creating it on
@@ -200,6 +217,7 @@ func (s *Store) PutMany(ctx context.Context, actor, collection string, items []I
 	}
 	defer tx.Rollback(ctx)
 	ids := make([]string, 0, len(items))
+	entries := make([]AuditEntry, 0, len(items))
 	for _, it := range items {
 		id := newID()
 		sealed, err := s.env.Seal(ctx, it.Plaintext, aad(collection, id))
@@ -219,14 +237,17 @@ func (s *Store) PutMany(ctx context.Context, actor, collection string, items []I
 				return nil, err
 			}
 		}
-		if err := audit(ctx, tx, AuditEntry{Client: actor, Action: "create", Collection: collection, ObjectID: id}); err != nil {
+		entry := AuditEntry{Client: actor, Action: "create", Collection: collection, ObjectID: id}
+		if err := audit(ctx, tx, entry); err != nil {
 			return nil, err
 		}
+		entries = append(entries, entry)
 		ids = append(ids, id)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	s.emit(entries...)
 	return ids, nil
 }
 
@@ -297,10 +318,15 @@ func (s *Store) Delete(ctx context.Context, actor, collection, id string) error 
 		`DELETE FROM blind_index WHERE collection = $1 AND object_id = $2`, collection, id); err != nil {
 		return err
 	}
-	if err := audit(ctx, tx, AuditEntry{Client: actor, Action: "delete", Collection: collection, ObjectID: id}); err != nil {
+	entry := AuditEntry{Client: actor, Action: "delete", Collection: collection, ObjectID: id}
+	if err := audit(ctx, tx, entry); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.emit(entry)
+	return nil
 }
 
 // Subject lists the live objects about one subject, across collections.
@@ -334,18 +360,22 @@ func (s *Store) DeleteSubject(ctx context.Context, actor, subject string) ([]Ref
 	if err != nil {
 		return nil, err
 	}
+	entries := make([]AuditEntry, 0, len(erased))
 	for _, r := range erased {
 		if _, err := tx.Exec(ctx,
 			`DELETE FROM blind_index WHERE collection = $1 AND object_id = $2`, r.Collection, r.ID); err != nil {
 			return nil, err
 		}
-		if err := audit(ctx, tx, AuditEntry{Client: actor, Action: "delete", Collection: r.Collection, ObjectID: r.ID}); err != nil {
+		entry := AuditEntry{Client: actor, Action: "delete", Collection: r.Collection, ObjectID: r.ID}
+		if err := audit(ctx, tx, entry); err != nil {
 			return nil, err
 		}
+		entries = append(entries, entry)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	s.emit(entries...)
 	return erased, nil
 }
 
@@ -455,7 +485,11 @@ func (s *Store) AuditMany(ctx context.Context, entries []AuditEntry) error {
 	for _, e := range entries {
 		batch.Queue(auditSQL, e.Client, e.Action, e.Collection, e.ObjectID, e.Field)
 	}
-	return s.pool.SendBatch(ctx, batch).Close()
+	if err := s.pool.SendBatch(ctx, batch).Close(); err != nil {
+		return err
+	}
+	s.emit(entries...)
+	return nil
 }
 
 const auditSQL = `INSERT INTO audit_log (client, action, collection, object_id, field)

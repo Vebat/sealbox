@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"slices"
@@ -630,6 +631,34 @@ func TestRuntimeRole(t *testing.T) {
 	if st, err := Open(ctx, u.String(), localEnvelope(t, testMasterKey[:]), false); err == nil {
 		st.Close()
 		t.Fatal("runtime open must fail while the schema is behind")
+	}
+}
+
+func TestAuditShippedToLogger(t *testing.T) {
+	// Every committed entry is also written to the logger, so the log can
+	// leave the host. Never a value.
+	ctx := context.Background()
+	s := newStore(t)
+	var out bytes.Buffer
+	s.AuditTo(slog.New(slog.NewJSONHandler(&out, nil)))
+	id := mustPut(t, s, "customers", `{"secret":"do-not-log"}`, nil)
+	if err := s.AuditMany(ctx, []AuditEntry{{Client: "support", Action: "reveal_masked", Collection: "customers", ObjectID: id}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, actor, "customers", id); err != nil {
+		t.Fatal(err)
+	}
+	log := out.String()
+	for _, want := range []string{`"action":"create"`, `"action":"reveal_masked"`, `"action":"delete"`, `"client":"support"`, `"object_id":"` + id + `"`} {
+		if !strings.Contains(log, want) {
+			t.Errorf("shipped log lacks %s:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "do-not-log") {
+		t.Error("shipped log leaks a value")
+	}
+	if strings.Count(log, "\n") != 3 {
+		t.Errorf("expected exactly three records:\n%s", log)
 	}
 }
 
