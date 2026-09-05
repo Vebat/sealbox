@@ -17,6 +17,8 @@ services:
       SEALBOX_DATABASE_URL: postgres://sealbox:sealbox@postgres:5432/sealbox?sslmode=disable
       # Dev only: plaintext HTTP inside the compose network. Production needs SEALBOX_TLS_CERT/KEY.
       SEALBOX_INSECURE_HTTP: "1"
+      SEALBOX_SCHEMA: /etc/sealbox/schema.json
+    volumes: ["./schema.example.json:/etc/sealbox/schema.json:ro"]
     ports: ["8080:8080"]
     depends_on: [postgres]
 

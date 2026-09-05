@@ -2,7 +2,7 @@
 //
 // Every route under /v1 requires "Authorization: Bearer <key>". Request and
 // response bodies are never logged: they are the personal data this service
-// exists to hide.
+// exists to hide. Reads are masked unless the caller asks for reveal=full.
 package api
 
 import (
@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Vebat/sealbox/internal/schema"
 	"github.com/Vebat/sealbox/internal/store"
 )
 
@@ -32,16 +33,19 @@ type Vault interface {
 }
 
 // New returns the /v1 handler. apiKey is compared in constant time.
-func New(v Vault, apiKey []byte) http.Handler {
-	s := &server{vault: v}
+func New(v Vault, s schema.Schema, apiKey []byte) http.Handler {
+	srv := &server{vault: v, schema: s}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/collections/{collection}/objects", s.create)
-	mux.HandleFunc("GET /v1/collections/{collection}/objects/{id}", s.get)
-	mux.HandleFunc("DELETE /v1/collections/{collection}/objects/{id}", s.delete)
+	mux.HandleFunc("POST /v1/collections/{collection}/objects", srv.create)
+	mux.HandleFunc("GET /v1/collections/{collection}/objects/{id}", srv.get)
+	mux.HandleFunc("DELETE /v1/collections/{collection}/objects/{id}", srv.delete)
 	return requireKey(apiKey, mux)
 }
 
-type server struct{ vault Vault }
+type server struct {
+	vault  Vault
+	schema schema.Schema
+}
 
 func requireKey(key []byte, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -75,6 +79,10 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "body must be a JSON object")
 		return
 	}
+	if err := s.schema.Validate(collection, obj); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	id, err := s.vault.Put(r.Context(), collection, body)
 	if err != nil {
 		internalError(w, "put", err)
@@ -84,16 +92,32 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) get(w http.ResponseWriter, r *http.Request) {
-	plaintext, err := s.vault.Get(r.Context(), r.PathValue("collection"), r.PathValue("id"))
+	reveal := r.URL.Query().Get("reveal")
+	if reveal != "" && reveal != "masked" && reveal != "full" {
+		writeError(w, http.StatusBadRequest, "reveal must be masked or full")
+		return
+	}
+	collection := r.PathValue("collection")
+	plaintext, err := s.vault.Get(r.Context(), collection, r.PathValue("id"))
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "object not found")
+		return
 	case err != nil:
 		internalError(w, "get", err)
-	default:
+		return
+	}
+	if reveal == "full" {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(plaintext)
+		return
 	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(plaintext, &obj); err != nil {
+		internalError(w, "get: stored object is not a JSON object", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.schema.Mask(collection, obj))
 }
 
 func (s *server) delete(w http.ResponseWriter, r *http.Request) {

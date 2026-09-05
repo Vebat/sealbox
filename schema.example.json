@@ -1,0 +1,10 @@
+{
+  "customers": {
+    "fields": {
+      "email":    { "type": "email" },
+      "phone":    { "type": "phone" },
+      "card":     { "type": "card" },
+      "passport": { "type": "string" }
+    }
+  }
+}

@@ -5,6 +5,7 @@
 //	SEALBOX_MASTER_KEY     required, 32 random bytes base64-encoded (openssl rand -base64 32)
 //	SEALBOX_API_KEY        required, bearer token clients must present (openssl rand -base64 32)
 //	SEALBOX_DATABASE_URL   required, Postgres connection string; use sslmode=verify-full
+//	SEALBOX_SCHEMA         optional path to a JSON schema file, see schema.example.json
 //	SEALBOX_ADDR           listen address, default :8080
 //	SEALBOX_TLS_CERT       PEM certificate; together with SEALBOX_TLS_KEY enables TLS
 //	SEALBOX_TLS_KEY        PEM private key
@@ -28,6 +29,7 @@ import (
 
 	"github.com/Vebat/sealbox/internal/api"
 	"github.com/Vebat/sealbox/internal/envelope"
+	"github.com/Vebat/sealbox/internal/schema"
 	"github.com/Vebat/sealbox/internal/store"
 )
 
@@ -45,6 +47,12 @@ func main() {
 	if len(apiKey) < 16 {
 		log.Fatal("SEALBOX_API_KEY must be at least 16 characters: openssl rand -base64 32")
 	}
+
+	sc, err := schema.Load(os.Getenv("SEALBOX_SCHEMA"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("schema: %d declared collection(s)", len(sc))
 
 	dbURL := os.Getenv("SEALBOX_DATABASE_URL")
 	if dbURL == "" {
@@ -80,7 +88,7 @@ func main() {
 		}
 		w.Write([]byte("ok\n"))
 	})
-	mux.Handle("/v1/", api.New(st, []byte(apiKey)))
+	mux.Handle("/v1/", api.New(st, sc, []byte(apiKey)))
 
 	srv := &http.Server{
 		Addr:              addr,

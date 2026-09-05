@@ -17,7 +17,8 @@ This is crypto-shredding, and it is the only practical way to honour an erasure 
 
 ## API
 
-Every request carries `Authorization: Bearer <SEALBOX_API_KEY>`. An object is any JSON object up to 1 MiB.
+Every request carries `Authorization: Bearer <SEALBOX_API_KEY>`. An object is a JSON object up to 1 MiB.
+Reads are masked unless the caller asks for `reveal=full`.
 
 ```http
 POST /v1/collections/customers/objects
@@ -25,6 +26,9 @@ POST /v1/collections/customers/objects
 -> 201 { "id": "tok_9f3a..." }
 
 GET /v1/collections/customers/objects/tok_9f3a...
+-> 200 { "email": "i***@example.com", "passport": "***" }
+
+GET /v1/collections/customers/objects/tok_9f3a...?reveal=full
 -> 200 { "email": "ivan@example.com", "passport": "4510 123456" }
 
 DELETE /v1/collections/customers/objects/tok_9f3a...
@@ -34,13 +38,38 @@ DELETE /v1/collections/customers/objects/tok_9f3a...
 Planned, not built yet:
 
 ```http
-GET /v1/collections/customers/objects/tok_9f3a...?reveal=masked
--> { "email": "i***@example.com", "passport": "45** ******" }
-
 POST /v1/collections/customers/search
 { "email": "ivan@example.com" }
 -> { "ids": ["tok_9f3a..."] }
 ```
+
+## Schemas
+
+A schema file, passed as `SEALBOX_SCHEMA`, declares what each collection holds. See [schema.example.json](schema.example.json):
+
+```json
+{ "customers": { "fields": {
+    "email":    { "type": "email" },
+    "phone":    { "type": "phone" },
+    "card":     { "type": "card" },
+    "passport": { "type": "string" }
+} } }
+```
+
+| Type | Accepts | Masked as |
+|---|---|---|
+| `string` | anything | `***` |
+| `email` | `local@domain` | `i***@example.com` |
+| `phone` | 7 to 15 digits, with `+ - ( ) .` and spaces | `***4567` |
+| `card` | 13 to 19 digits passing Luhn, with `-` and spaces | `**** **** **** 1234` |
+
+Rules:
+
+- In a declared collection every value must be a string of the declared type; unknown fields are rejected. Fields are optional.
+- A collection missing from the schema is free-form: any JSON object is accepted, and a masked read hides every value as `***`.
+- Masks are fixed per type. What they keep, the email domain and the last four digits, is visible to every holder of the API key by design.
+- Validation errors name the field, never the submitted value.
+- The schema is read at startup. Change the file, restart the process.
 
 ## Transport
 
@@ -84,8 +113,13 @@ export KEY=$(sed -n 's/^SEALBOX_API_KEY=//p' .env)
 curl -s -H "Authorization: Bearer $KEY" -d '{"email":"ivan@example.com"}' localhost:8080/v1/collections/customers/objects
 # {"id":"tok_..."}
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/collections/customers/objects/tok_...
+# {"email":"i***@example.com"}
+curl -s -H "Authorization: Bearer $KEY" "localhost:8080/v1/collections/customers/objects/tok_...?reveal=full"
+# {"email":"ivan@example.com"}
 curl -s -X DELETE -H "Authorization: Bearer $KEY" localhost:8080/v1/collections/customers/objects/tok_...
 ```
+
+The compose file mounts `schema.example.json`, which is why `email` is masked as an address rather than as `***`.
 
 Or without Docker, against your own Postgres:
 
@@ -101,7 +135,7 @@ Each item is one release.
 - [x] Envelope encryption: XChaCha20-Poly1305, fresh key per object, ciphertext bound to the object id
 - [x] Postgres store; delete destroys the wrapped key, with a test that proves the ciphertext is dead
 - [x] HTTP API: create, get, delete; one API key; TLS built in, plaintext only on loopback
-- [ ] Collection schemas, field types, masks
+- [x] Collection schemas from a JSON file; email, phone, card and string types; masked reads by default
 - [ ] API key roles: write, read masked, read full
 - [ ] Blind index for exact-match search on email and phone
 - [ ] Append-only audit log of every reveal
@@ -123,6 +157,7 @@ Each item is one release.
 cmd/sealbox/                entry point, config from env, TLS
 internal/api/               HTTP handlers, bearer auth, input limits
 internal/envelope/          per-object keys wrapped under the master key
+internal/schema/            field types, validation, masks; loaded from SEALBOX_SCHEMA
 internal/store/             Postgres; delete nulls the wrapped key, the row stays
 internal/store/migrations/  numbered SQL files, applied once each at startup
 ```
