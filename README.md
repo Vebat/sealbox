@@ -182,6 +182,11 @@ Moving an existing database to a key service is a rotation: set `SEALBOX_KMS`, k
 it opens the old rows, restart, run `sealbox rotate`, then drop the master key. Every wrap and unwrap is a network
 call, so expect a few milliseconds per object on reads.
 
+Rotating the key inside the service is finished the same way. After `vault write -f transit/keys/sealbox/rotate`,
+or a new master key version in keeper, run `sealbox rotate`: it asks the engine to re-wrap every key under the
+current version, one call per object, and only rows whose version actually moved are written. Then the old
+version can be retired, `min_decryption_version` in Vault, the old line in keeper's key file.
+
 ### Rotation
 
 Rotation re-wraps keys, it does not re-encrypt data, so it runs while the service is up.

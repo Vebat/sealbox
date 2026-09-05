@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -400,6 +402,104 @@ func TestRotate(t *testing.T) {
 	if st, err := Open(ctx, testDatabaseURL(t), localEnvelope(t, old)); err == nil {
 		st.Close()
 		t.Fatal("old key alone must not open the store after rotation")
+	}
+}
+
+// versioned stands in for a transit engine: one wrapper id, key versions of
+// its own, re-wrap in place. Wrapped keys are "v<version>:<ref>".
+type versioned struct {
+	version int
+	keys    map[string]struct{ dek, aad []byte }
+}
+
+func (v *versioned) ID() string { return "mem:versioned" }
+
+func (v *versioned) Wrap(_ context.Context, dek, aad []byte) ([]byte, error) {
+	ref := fmt.Sprintf("v%d:%s", v.version, newID())
+	v.keys[ref] = struct{ dek, aad []byte }{bytes.Clone(dek), bytes.Clone(aad)}
+	return []byte(ref), nil
+}
+
+func (v *versioned) Unwrap(_ context.Context, wrapped, aad []byte) ([]byte, error) {
+	k, ok := v.keys[string(wrapped)]
+	if !ok || !bytes.Equal(k.aad, aad) {
+		return nil, envelope.ErrOpen
+	}
+	return k.dek, nil
+}
+
+func (v *versioned) Rewrap(ctx context.Context, wrapped, aad []byte) ([]byte, bool, error) {
+	if strings.HasPrefix(string(wrapped), fmt.Sprintf("v%d:", v.version)) {
+		return wrapped, false, nil
+	}
+	dek, err := v.Unwrap(ctx, wrapped, aad)
+	if err != nil {
+		return nil, false, err
+	}
+	re, err := v.Wrap(ctx, dek, aad)
+	return re, true, err
+}
+
+func TestRotateInPlace(t *testing.T) {
+	ctx := context.Background()
+	local, err := envelope.NewLocal(testMasterKey[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &versioned{version: 1, keys: map[string]struct{ dek, aad []byte }{}}
+
+	// Move to the key service; leave the database on the test key afterwards.
+	s, err := Open(ctx, testDatabaseURL(t), envelope.New(engine, local))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+	t.Cleanup(func() {
+		back, err := Open(ctx, testDatabaseURL(t), envelope.New(local, engine))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer back.Close()
+		if _, _, err := back.Rotate(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, _, err := s.Rotate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id := mustPut(t, s, "customers", `{"n":"1"}`, nil)
+	wrapped := func() string {
+		var w []byte
+		if err := s.pool.QueryRow(ctx, `SELECT wrapped_dek FROM objects WHERE id = $1`, id).Scan(&w); err != nil {
+			t.Fatal(err)
+		}
+		return string(w)
+	}
+	if !strings.HasPrefix(wrapped(), "v1:") {
+		t.Fatalf("wrapped under %q", wrapped())
+	}
+	if n, _, err := s.Rotate(ctx); err != nil || n != 0 {
+		t.Fatalf("nothing to move yet: %d, %v", n, err)
+	}
+
+	// The service rotated its key: rows keep their key_id, the wrapped bytes move.
+	engine.version = 2
+	n, _, err := s.Rotate(ctx)
+	if err != nil || n < 2 {
+		t.Fatalf("expected the index key and the object to move, rotated %d, %v", n, err)
+	}
+	if !strings.HasPrefix(wrapped(), "v2:") {
+		t.Fatalf("still wrapped under %q", wrapped())
+	}
+	var keyID string
+	if err := s.pool.QueryRow(ctx, `SELECT key_id FROM objects WHERE id = $1`, id).Scan(&keyID); err != nil || keyID != engine.ID() {
+		t.Fatalf("key_id %q, %v", keyID, err)
+	}
+	if got, err := get(s, "customers", id); err != nil || string(got) != `{"n":"1"}` {
+		t.Fatalf("read after in-place rewrap: %q, %v", got, err)
+	}
+	if n, _, err := s.Rotate(ctx); err != nil || n != 0 {
+		t.Fatalf("second run must be a no-op: %d, %v", n, err)
 	}
 }
 

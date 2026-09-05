@@ -54,6 +54,17 @@ type Wrapper interface {
 	Unwrap(ctx context.Context, wrapped, aad []byte) ([]byte, error)
 }
 
+// Rewrapper is a Wrapper whose backend keeps key versions of its own and can
+// move a wrapped key to its current version in place: the wrapper's ID stays
+// the same, only the wrapped bytes change. Transit engines do this. A local
+// master key does not; it changes ID instead.
+type Rewrapper interface {
+	Wrapper
+	// Rewrap returns wrapped re-sealed under the backend's current version,
+	// and whether anything changed.
+	Rewrap(ctx context.Context, wrapped, aad []byte) ([]byte, bool, error)
+}
+
 // Local wraps with a master key held in this process: XChaCha20-Poly1305
 // with the row identity as associated data.
 type Local struct {
@@ -128,6 +139,13 @@ func New(current Wrapper, previous ...Wrapper) *Envelope {
 // CurrentKeyID is the id of the wrapper that wraps new objects.
 func (e *Envelope) CurrentKeyID() string { return e.current.ID() }
 
+// RewrapsInPlace reports whether rows already under the current wrapper may
+// still need re-wrapping, because its backend has key versions of its own.
+func (e *Envelope) RewrapsInPlace() bool {
+	_, ok := e.current.(Rewrapper)
+	return ok
+}
+
 // Seal encrypts plaintext under a fresh DEK wrapped by the current wrapper.
 // aad is authenticated but not encrypted; pass the row identity so a
 // ciphertext cannot be moved to another row without failing to open.
@@ -169,10 +187,20 @@ func (e *Envelope) Open(ctx context.Context, s Sealed, aad []byte) ([]byte, erro
 // Rewrap returns s with its per-object key wrapped by the current wrapper.
 // Ciphertext is carried over untouched and may be nil. The bool reports
 // whether anything changed. Moving from one wrapper to another, for example
-// from a local master key to a KMS, is the same operation.
+// from a local master key to a KMS, is the same operation. A row already
+// under a Rewrapper is handed to the backend, which moves it to its current
+// key version.
 func (e *Envelope) Rewrap(ctx context.Context, s Sealed, aad []byte) (Sealed, bool, error) {
 	if s.KeyID == e.current.ID() {
-		return s, false, nil
+		rw, ok := e.current.(Rewrapper)
+		if !ok {
+			return s, false, nil
+		}
+		wrapped, changed, err := rw.Rewrap(ctx, s.WrappedDEK, aad)
+		if err != nil || !changed {
+			return s, false, err
+		}
+		return Sealed{KeyID: s.KeyID, WrappedDEK: wrapped, Ciphertext: s.Ciphertext}, true, nil
 	}
 	dek, err := e.unwrap(ctx, s, aad)
 	if err != nil {

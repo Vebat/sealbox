@@ -79,6 +79,40 @@ func (t *Transit) Unwrap(ctx context.Context, wrapped, aad []byte) ([]byte, erro
 	return dek, nil
 }
 
+// Rewrap asks the engine to re-encrypt the wrapped key under its current key
+// version. Engines answer with fresh ciphertext even when the version did not
+// move, so the version segment of the ciphertext decides whether anything
+// changed.
+func (t *Transit) Rewrap(ctx context.Context, wrapped, aad []byte) ([]byte, bool, error) {
+	var res struct {
+		Data struct {
+			Ciphertext string `json:"ciphertext"`
+		} `json:"data"`
+	}
+	err := t.call(ctx, "rewrap", map[string]string{
+		"ciphertext": string(wrapped),
+		"context":    base64.StdEncoding.EncodeToString(aad),
+	}, &res)
+	if err != nil {
+		return nil, false, err
+	}
+	return []byte(res.Data.Ciphertext), version(res.Data.Ciphertext) != version(string(wrapped)), nil
+}
+
+// version returns the "<scheme>:<version>" prefix of a transit ciphertext,
+// "vault:v2" or "keeper:<id>", or the whole string when there is none.
+func version(ciphertext string) string {
+	first := strings.IndexByte(ciphertext, ':')
+	if first < 0 {
+		return ciphertext
+	}
+	second := strings.IndexByte(ciphertext[first+1:], ':')
+	if second < 0 {
+		return ciphertext
+	}
+	return ciphertext[:first+1+second]
+}
+
 // call posts to /v1/<mount>/<op>/<key>. A 400 means the engine rejected the
 // ciphertext or context and maps to ErrOpen; anything else is a backend
 // failure and keeps its own message, which never contains key material.
