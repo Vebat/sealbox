@@ -1,3 +1,4 @@
+-- +goose Up
 -- objects: every value in its own row, sealed under a per-object key that is
 -- wrapped by the master key named by key_id. Delete nulls wrapped_dek and
 -- keeps the row: the ciphertext is then unrecoverable here and in every

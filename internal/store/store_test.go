@@ -625,10 +625,11 @@ func TestRuntimeRole(t *testing.T) {
 	}
 
 	// A binary that is ahead of the schema refuses to serve.
-	if _, err := owner.pool.Exec(ctx, `UPDATE schema_version SET version = version - 1`); err != nil {
+	if _, err := owner.pool.Exec(ctx,
+		`UPDATE goose_db_version SET is_applied = false WHERE version_id = (SELECT max(version_id) FROM goose_db_version)`); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { owner.pool.Exec(ctx, `UPDATE schema_version SET version = version + 1`) })
+	t.Cleanup(func() { owner.pool.Exec(ctx, `UPDATE goose_db_version SET is_applied = true`) })
 	if st, err := Open(ctx, u.String(), localEnvelope(t, testMasterKey[:]), false); err == nil {
 		st.Close()
 		t.Fatal("runtime open must fail while the schema is behind")

@@ -405,6 +405,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Signed releases with an SBOM on every tag
 - [x] Batch reads through a key service unwrap 500 keys per round trip
 - [x] Fragment indexes: search a card or phone by its last four digits
+- [x] Migrations moved from tern to goose: four transitive modules instead of eleven
 
 ## Design rules
 
@@ -436,7 +437,7 @@ carries a license outside Apache-2.0, BSD, MIT or ISC.
 |---|---|---|
 | golang.org/x/crypto | BSD-3-Clause | XChaCha20-Poly1305 |
 | github.com/jackc/pgx/v5 | MIT | Postgres driver |
-| github.com/jackc/tern/v2 | MIT | SQL migrations with an advisory lock |
+| github.com/pressly/goose/v3 | MIT | SQL migrations with a session lock |
 | golang.org/x/time | BSD-3-Clause | per-client rate limiting |
 
 The full transitive list: `go run github.com/google/go-licenses@v1.6.0 report ./...`.
@@ -452,6 +453,10 @@ SEALBOX_TEST_DATABASE_URL=postgres://sealbox:sealbox@localhost:5430/sealbox?sslm
 Store tests are skipped when `SEALBOX_TEST_DATABASE_URL` is not set. CI runs them against a Postgres service.
 They use a fixed test master key, so a database that has already been used by the quickstart server, or was left mid-rotation
 by a killed run, refuses to open. Reset it with `docker compose down -v`.
+
+Migrations are plain SQL files under `internal/store/migrations`, one `-- +goose Up` section each, applied by goose and
+recorded in `goose_db_version`. Databases created by releases before v0.3.0 were tracked by a different tool and must be
+recreated; there were no production deployments to migrate.
 
 ## License
 

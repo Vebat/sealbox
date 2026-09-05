@@ -21,7 +21,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jackc/tern/v2/migrate"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 
 	"github.com/Vebat/sealbox/internal/envelope"
 )
@@ -97,26 +99,26 @@ func Open(ctx context.Context, databaseURL string, env *envelope.Envelope, migra
 }
 
 // migrateUp applies migrations/*.sql that are not yet recorded in
-// schema_version. tern runs each file in its own transaction and holds an
-// advisory lock, so several replicas may start at the same time.
+// goose_db_version. goose runs each file in its own transaction and holds a
+// session-level advisory lock, so several replicas may start at the same
+// time.
 func migrateUp(ctx context.Context, pool *pgxpool.Pool) error {
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Release()
-	m, err := migrate.NewMigrator(ctx, conn.Conn(), "schema_version")
-	if err != nil {
-		return err
-	}
 	files, err := fs.Sub(migrationsFS, "migrations")
 	if err != nil {
 		return err
 	}
-	if err := m.LoadMigrations(files); err != nil {
+	locker, err := lock.NewPostgresSessionLocker()
+	if err != nil {
 		return err
 	}
-	return m.Migrate(ctx)
+	db := stdlib.OpenDBFromPool(pool)
+	defer db.Close()
+	p, err := goose.NewProvider(goose.DialectPostgres, db, files, goose.WithSessionLocker(locker))
+	if err != nil {
+		return err
+	}
+	_, err = p.Up(ctx)
+	return err
 }
 
 // schemaCurrent checks, with nothing but SELECT, that every embedded
@@ -126,9 +128,10 @@ func schemaCurrent(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return err
 	}
-	var version int32
-	if err := pool.QueryRow(ctx, `SELECT version FROM schema_version`).Scan(&version); err != nil {
-		return fmt.Errorf("reading schema_version (run \"sealbox migrate\" first): %w", err)
+	var version int64
+	if err := pool.QueryRow(ctx,
+		`SELECT coalesce(max(version_id), 0) FROM goose_db_version WHERE is_applied`).Scan(&version); err != nil {
+		return fmt.Errorf("reading goose_db_version (run \"sealbox migrate\" first): %w", err)
 	}
 	if int(version) != len(files) {
 		return fmt.Errorf("schema is at version %d, this binary needs %d: run \"sealbox migrate\" with the owner role", version, len(files))
@@ -144,7 +147,7 @@ func (s *Store) Grant(ctx context.Context, role string) error {
 	r := pgx.Identifier{role}.Sanitize()
 	for _, stmt := range []string{
 		`GRANT USAGE ON SCHEMA public TO ` + r,
-		`GRANT SELECT ON schema_version TO ` + r,
+		`GRANT SELECT ON goose_db_version TO ` + r,
 		`GRANT SELECT, INSERT, UPDATE ON objects TO ` + r,
 		`GRANT SELECT, INSERT, DELETE ON blind_index TO ` + r,
 		`GRANT SELECT, INSERT, UPDATE ON keys TO ` + r,
