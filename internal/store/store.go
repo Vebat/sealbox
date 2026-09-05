@@ -379,6 +379,98 @@ func (s *Store) DeleteSubject(ctx context.Context, actor, subject string) ([]Ref
 	return erased, nil
 }
 
+// Reindex rebuilds the blind-index rows of every live object, or of one
+// collection when collection is not empty. indexed turns an object's
+// plaintext into its normalized indexed values under the current schema;
+// the store never sees the schema itself. Each object is done in its own
+// transaction with an audit entry, since its plaintext was opened. Objects
+// that no longer open, or that the schema cannot read, are logged by id,
+// counted in skipped, and left alone.
+func (s *Store) Reindex(ctx context.Context, actor, collection string, indexed func(collection string, plaintext []byte) (map[string]string, error)) (done, skipped int, err error) {
+	type row struct {
+		ID, Collection, KeyID  string
+		WrappedDEK, Ciphertext []byte
+	}
+	last := ""
+	for {
+		rows, err := s.pool.Query(ctx,
+			`SELECT id, collection, key_id, wrapped_dek, ciphertext FROM objects
+			 WHERE deleted_at IS NULL AND (collection = $1 OR $1 = '') AND id > $2
+			 ORDER BY id LIMIT 500`,
+			collection, last)
+		if err != nil {
+			return done, skipped, err
+		}
+		page, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
+		if err != nil {
+			return done, skipped, err
+		}
+		if len(page) == 0 {
+			return done, skipped, nil
+		}
+		for _, r := range page {
+			last = r.ID
+			plaintext, err := s.env.Open(ctx, envelope.Sealed{KeyID: r.KeyID, WrappedDEK: r.WrappedDEK, Ciphertext: r.Ciphertext}, aad(r.Collection, r.ID))
+			if errors.Is(err, envelope.ErrOpen) || errors.Is(err, envelope.ErrUnknownKey) {
+				log.Printf("store: reindex: skipping object %s: %v", r.ID, err)
+				skipped++
+				continue
+			}
+			if err != nil {
+				return done, skipped, fmt.Errorf("object %s: %w", r.ID, err)
+			}
+			values, err := indexed(r.Collection, plaintext)
+			if err != nil {
+				// An object the schema cannot read is not a reason to stop.
+				log.Printf("store: reindex: skipping object %s: %v", r.ID, err)
+				skipped++
+				continue
+			}
+			if err := s.rewriteIndex(ctx, actor, r.Collection, r.ID, values); err != nil {
+				return done, skipped, err
+			}
+			done++
+		}
+	}
+}
+
+// rewriteIndex replaces an object's index rows in one transaction, unless
+// it was shredded meanwhile, and logs that its plaintext was opened.
+func (s *Store) rewriteIndex(ctx context.Context, actor, collection, id string, values map[string]string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var live bool
+	if err := tx.QueryRow(ctx,
+		`SELECT deleted_at IS NULL FROM objects WHERE id = $1 FOR UPDATE`, id).Scan(&live); err != nil {
+		return err
+	}
+	if !live {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM blind_index WHERE collection = $1 AND object_id = $2`, collection, id); err != nil {
+		return err
+	}
+	for field, value := range values {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO blind_index (collection, field, hash, object_id) VALUES ($1, $2, $3, $4)`,
+			collection, field, s.index.Hash(collection, field, value), id); err != nil {
+			return err
+		}
+	}
+	entry := AuditEntry{Client: actor, Action: "reindex", Collection: collection, ObjectID: id}
+	if err := audit(ctx, tx, entry); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.emit(entry)
+	return nil
+}
+
 // Rotate re-wraps the blind-index key and every live per-object key that is
 // not yet under the current wrapping key, which is also how a database
 // moves from a local master key to a key service. When the current wrapper
@@ -469,7 +561,7 @@ func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
 // who did what to which object, and for searches which field was queried.
 type AuditEntry struct {
 	Client     string
-	Action     string // create, reveal_masked, reveal_full, search, delete
+	Action     string // create, reveal_masked, reveal_full, search, delete, reindex
 	Collection string
 	ObjectID   string // empty for search
 	Field      string // search only

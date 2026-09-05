@@ -4,6 +4,9 @@
 //	                 when SEALBOX_RUNTIME_ROLE is set, grants that role what a running
 //	                 server needs, with an audit log it can only append to
 //	sealbox rotate   re-wraps every key under the current wrapping key
+//	sealbox reindex [collection]
+//	                 rebuilds the blind index under the current schema, after a field
+//	                 gained or lost index: true; opens every object, and logs that
 //
 // A server started with SEALBOX_MIGRATE=off never touches the schema; it
 // checks that the schema is current and refuses to start otherwise. That is
@@ -54,6 +57,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -105,8 +109,14 @@ func main() {
 			migrateAndGrant(dbURL, env)
 		case "rotate":
 			rotate(dbURL, env, migrate)
+		case "reindex":
+			collection := ""
+			if len(os.Args) > 2 {
+				collection = os.Args[2]
+			}
+			reindex(dbURL, env, migrate, collection)
 		default:
-			log.Fatalf("unknown command %q: expected migrate or rotate", os.Args[1])
+			log.Fatalf("unknown command %q: expected migrate, rotate or reindex", os.Args[1])
 		}
 		return
 	}
@@ -249,6 +259,41 @@ func rotate(dbURL string, env *envelope.Envelope, migrate bool) {
 	log.Printf("rotate: %d key(s) now under %s, %d skipped", rotated, env.CurrentKeyID(), skipped)
 	if skipped > 0 {
 		log.Fatalf("rotate: %d row(s) could not be re-wrapped, see the lines above: load missing keys as previous keys and run again, or investigate rows that no longer open", skipped)
+	}
+}
+
+// reindex rebuilds the blind index under the schema in SEALBOX_SCHEMA. Run
+// it after adding index: true to a field, with the servers already restarted
+// on the new schema so new objects are indexed as they arrive.
+func reindex(dbURL string, env *envelope.Envelope, migrate bool, collection string) {
+	sc, err := schema.Load(os.Getenv("SEALBOX_SCHEMA"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	st, err := store.Open(ctx, dbURL, env, migrate)
+	cancel()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer st.Close()
+	if os.Getenv("SEALBOX_AUDIT_STDOUT") == "1" {
+		st.AuditTo(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	}
+	indexed := func(collection string, plaintext []byte) (map[string]string, error) {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(plaintext, &obj); err != nil {
+			return nil, err
+		}
+		return sc.Indexed(collection, obj), nil
+	}
+	done, skipped, err := st.Reindex(context.Background(), "reindex", collection, indexed)
+	if err != nil {
+		log.Fatalf("reindex: %v (after %d objects)", err, done)
+	}
+	log.Printf("reindex: %d object(s) reindexed, %d skipped", done, skipped)
+	if skipped > 0 {
+		os.Exit(1)
 	}
 }
 

@@ -157,7 +157,9 @@ Rules:
   index key that is created on first start and kept in the `keys` table wrapped by the master key. Back that table up with the rest.
   A database dump shows which records share a value, not what it is, and cannot be used to test guesses without the master key.
 - Validation errors name the field, never the submitted value.
-- The schema is read at startup. Change the file, restart the process. Adding `index` to a field indexes new objects only; re-indexing existing ones is not built yet.
+- The schema is read at startup. Change the file, restart the process. Adding `index` to a field indexes new objects
+  from then on; run `sealbox reindex [collection]` with the same schema to rebuild the index for existing ones.
+  It opens every object to do so, and writes a `reindex` audit entry per object to say that it did.
 
 ## Master key
 
@@ -251,6 +253,7 @@ data is returned: if the log cannot be written, the request fails and nothing is
 | `reveal_full` | a plaintext read |
 | `search` | a lookup by an indexed field |
 | `delete` | a crypto-shred |
+| `reindex` | `sealbox reindex` opened the object to rebuild its index rows |
 
 Read it with SQL. Everything about one person:
 
@@ -354,7 +357,6 @@ SEALBOX_DATABASE_URL=postgres://user:pass@localhost:5432/sealbox SEALBOX_ADDR=12
 Not built yet, in the order they are likely to matter:
 
 - Signed releases and an SBOM
-- Re-indexing existing objects when a field gains `index: true`
 - A third-party audit
 
 ## Done
@@ -374,6 +376,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Per-client reveal budget: full reveals and searches rate-limited, masked reads free
 - [x] Two database roles: `sealbox migrate` with the owner, servers with a role whose audit log is append-only
 - [x] Hardening: audit entries to stdout for shipping, no core dumps on Linux, client certificates for the API
+- [x] `sealbox reindex`: rebuild the blind index for existing objects under a changed schema
 
 ## Design rules
 

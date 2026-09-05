@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -631,6 +632,63 @@ func TestRuntimeRole(t *testing.T) {
 	if st, err := Open(ctx, u.String(), localEnvelope(t, testMasterKey[:]), false); err == nil {
 		st.Close()
 		t.Fatal("runtime open must fail while the schema is behind")
+	}
+}
+
+func TestReindex(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	email, phone := uniqueEmail(), "7921"+newID()[4:11]
+	// Stored when only email was indexed.
+	id := mustPut(t, s, "customers", `{"email":"`+email+`","phone":"`+phone+`"}`, map[string]string{"email": email})
+	gone := mustPut(t, s, "customers", `{"email":"x","phone":"`+phone+`"}`, nil)
+	if err := s.Delete(ctx, actor, "customers", gone); err != nil {
+		t.Fatal(err)
+	}
+	other := mustPut(t, s, "staff", `{"phone":"`+phone+`"}`, nil)
+
+	// Now phone is indexed too; the "schema" here is a function of the plaintext.
+	indexed := func(collection string, plaintext []byte) (map[string]string, error) {
+		var obj map[string]string
+		if err := json.Unmarshal(plaintext, &obj); err != nil {
+			return nil, err
+		}
+		out := map[string]string{}
+		for _, f := range []string{"email", "phone"} {
+			if v, ok := obj[f]; ok {
+				out[f] = v
+			}
+		}
+		return out, nil
+	}
+	// Other tests leave non-JSON and deliberately broken rows behind; those
+	// are skipped and reported, never fatal.
+	done, _, err := s.Reindex(ctx, actor, "customers", indexed)
+	if err != nil || done < 1 {
+		t.Fatalf("reindex: done=%d err=%v", done, err)
+	}
+	if hits, _ := s.Search(ctx, "customers", "phone", phone); !slices.Equal(hits, []string{id}) {
+		t.Fatalf("phone now searchable: %v", hits)
+	}
+	if hits, _ := s.Search(ctx, "customers", "email", email); !slices.Equal(hits, []string{id}) {
+		t.Fatalf("email still searchable: %v", hits)
+	}
+	if hits, _ := s.Search(ctx, "staff", "phone", phone); len(hits) != 0 {
+		t.Fatalf("other collection untouched by a scoped reindex: %v", hits)
+	}
+	if got := auditActions(t, s, id); got[len(got)-1] != "reindex" {
+		t.Fatalf("opening plaintext must be logged: %v", got)
+	}
+	if got := auditActions(t, s, gone); slices.Contains(got, "reindex") {
+		t.Fatalf("shredded objects are not opened: %v", got)
+	}
+
+	// Unscoped, every collection.
+	if _, _, err := s.Reindex(ctx, actor, "", indexed); err != nil {
+		t.Fatal(err)
+	}
+	if hits, _ := s.Search(ctx, "staff", "phone", phone); !slices.Equal(hits, []string{other}) {
+		t.Fatalf("staff phone after full reindex: %v", hits)
 	}
 }
 
