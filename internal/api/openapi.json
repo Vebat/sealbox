@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "sealbox",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Encrypted vault for personal data. Your application stores tokens; sealbox stores ciphertext under a key that exists only for that one object. Delete the key, shred the data. Every reveal is written to the audit log before the data is returned."
   },
   "servers": [{ "url": "/" }],
