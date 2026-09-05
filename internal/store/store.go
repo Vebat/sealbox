@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -254,8 +255,10 @@ func (s *Store) Delete(ctx context.Context, collection, id string) error {
 // Rotate re-wraps the blind-index key and every live per-object key that is
 // not yet under the current master key. Ciphertext is never touched, and
 // rows are handled in pages with no long transaction, so it is safe to run
-// while serving. Rows wrapped by a key this server does not hold are left
-// alone and counted in skipped.
+// while serving. Rows that cannot be re-wrapped, because they name a master
+// key this server does not hold or because they no longer open at all, are
+// logged by id, counted in skipped, and left as they are: one bad row must
+// not block the rotation of every other.
 func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
 	current := s.env.CurrentKeyID()
 
@@ -300,12 +303,10 @@ func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
 		for _, r := range page {
 			last = r.ID
 			re, _, err := s.env.Rewrap(envelope.Sealed{KeyID: r.KeyID, WrappedDEK: r.WrappedDEK}, aad(r.Collection, r.ID))
-			if errors.Is(err, envelope.ErrUnknownKey) {
+			if err != nil {
+				log.Printf("store: rotate: skipping object %s: %v", r.ID, err)
 				skipped++
 				continue
-			}
-			if err != nil {
-				return rotated, skipped, fmt.Errorf("object %s: %w", r.ID, err)
 			}
 			// deleted_at IS NULL again: never write a key back into a row
 			// that was shredded since it was read.

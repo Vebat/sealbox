@@ -154,7 +154,7 @@ func rotate(dbURL string, env *envelope.Envelope) {
 	}
 	log.Printf("rotate: %d key(s) now under master key %s, %d skipped", rotated, env.CurrentKeyID(), skipped)
 	if skipped > 0 {
-		log.Fatalf("rotate: %d row(s) are wrapped by master keys this process does not have; load them as previous keys and run again", skipped)
+		log.Fatalf("rotate: %d row(s) could not be re-wrapped, see the lines above: load missing master keys as previous keys and run again, or investigate rows that no longer open", skipped)
 	}
 }
 
