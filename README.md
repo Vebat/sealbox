@@ -129,6 +129,48 @@ Rules:
 - Validation errors name the field, never the submitted value.
 - The schema is read at startup. Change the file, restart the process. Adding `index` to a field indexes new objects only; re-indexing existing ones is not built yet.
 
+## Master key
+
+Exactly one of these supplies it:
+
+| Variable | Reads the key from |
+|---|---|
+| `SEALBOX_MASTER_KEY` | the variable itself |
+| `SEALBOX_MASTER_KEY_FILE` | a file, for Kubernetes and Docker secrets |
+| `SEALBOX_MASTER_KEY_COMMAND` | the output of a command, for a KMS or a secret store |
+
+The value is one or more base64 keys, one per line or comma-separated. The first is the current key and wraps
+every new object. The rest are previous keys, still needed to open rows that have not been re-wrapped yet.
+
+With a KMS the key never sits in the environment; the command fetches it at startup:
+
+```sh
+SEALBOX_MASTER_KEY_COMMAND="aws kms decrypt --ciphertext-blob fileb:///etc/sealbox/master.enc --query Plaintext --output text"
+SEALBOX_MASTER_KEY_COMMAND="vault kv get -field=master secret/sealbox"
+```
+
+The command runs without a shell. Wrap pipes in a script.
+
+Losing the master key loses every object. Back it up outside the database and test the restore.
+sealbox logs the fingerprint of the current key at startup.
+
+### Rotation
+
+Rotation re-wraps keys, it does not re-encrypt data, so it runs while the service is up.
+
+1. Generate a new key. Put it first and keep the old one after it, then restart every replica.
+   New objects are wrapped under the new key; old ones still open.
+2. Run `sealbox rotate` with the same configuration. It re-wraps the blind-index key and every live
+   object's key in pages, prints the counts, and exits non-zero if any row was wrapped by a key it does not have.
+3. Remove the old key and restart. Check that one fingerprint remains, the one logged at startup:
+
+```sql
+SELECT key_id, count(*) FROM objects WHERE deleted_at IS NULL GROUP BY 1;
+```
+
+Rotation limits future exposure. Whoever held the old key together with a dump taken while it was in use
+can still open those rows.
+
 ## Audit log
 
 Every successful action is written to the `audit_log` table: which client did what, to which object, when.
@@ -223,7 +265,7 @@ Each item is one release.
 - [x] Audit log: every create, reveal, search and delete, written before the data leaves
 - [x] Batch create, atomic up to 1000 objects, and batch reveal with per-object audit
 - [x] OpenAPI spec, served at /openapi.json and tested against the routes; Go client package
-- [ ] Master key from a KMS, key rotation
+- [x] Master key from a file or a command (KMS); rotation by re-wrapping, while serving
 
 ## Design rules
 

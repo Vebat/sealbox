@@ -31,13 +31,20 @@ var migrationsFS embed.FS
 // belong to a different collection. The cases are not distinguished.
 var ErrNotFound = errors.New("store: object not found")
 
+// The blind-index key is a service key stored in the keys table.
+const indexKeyName = "blind-index"
+
+var indexKeyAAD = []byte("keys/" + indexKeyName)
+
 // Store seals values before they reach Postgres and opens them after.
 type Store struct {
-	pool *pgxpool.Pool
-	env  *envelope.Envelope
+	pool  *pgxpool.Pool
+	env   *envelope.Envelope
+	index *envelope.Index
 }
 
-// Open connects to databaseURL and applies pending migrations.
+// Open connects to databaseURL, applies pending migrations and loads the
+// blind-index key, creating it on the very first start.
 func Open(ctx context.Context, databaseURL string, env *envelope.Envelope) (*Store, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
@@ -47,7 +54,12 @@ func Open(ctx context.Context, databaseURL string, env *envelope.Envelope) (*Sto
 		pool.Close()
 		return nil, fmt.Errorf("store: migrate: %w", err)
 	}
-	return &Store{pool: pool, env: env}, nil
+	index, err := loadIndexKey(ctx, pool, env)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("store: blind-index key: %w", err)
+	}
+	return &Store{pool: pool, env: env, index: index}, nil
 }
 
 // migrateUp applies migrations/*.sql that are not yet recorded in
@@ -71,6 +83,33 @@ func migrateUp(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	return m.Migrate(ctx)
+}
+
+// loadIndexKey returns the blind-index key. Every starting replica proposes a
+// fresh random key; the first insert wins and everyone reads that one back.
+func loadIndexKey(ctx context.Context, pool *pgxpool.Pool, env *envelope.Envelope) (*envelope.Index, error) {
+	candidate := make([]byte, envelope.KeySize)
+	rand.Read(candidate)
+	sealed, err := env.Seal(candidate, indexKeyAAD)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO keys (name, key_id, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (name) DO NOTHING`,
+		indexKeyName, sealed.KeyID, sealed.WrappedDEK, sealed.Ciphertext); err != nil {
+		return nil, err
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT key_id, wrapped_dek, ciphertext FROM keys WHERE name = $1`, indexKeyName).
+		Scan(&sealed.KeyID, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
+		return nil, err
+	}
+	key, err := env.Open(sealed, indexKeyAAD)
+	if err != nil {
+		return nil, fmt.Errorf("wrapped by master key %s: %w", sealed.KeyID, err)
+	}
+	return envelope.NewIndex(key)
 }
 
 // Close releases the connection pool.
@@ -112,14 +151,14 @@ func (s *Store) PutMany(ctx context.Context, collection string, items []Item) ([
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO objects (id, collection, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4)`,
-			id, collection, sealed.WrappedDEK, sealed.Ciphertext); err != nil {
+			`INSERT INTO objects (id, collection, key_id, wrapped_dek, ciphertext) VALUES ($1, $2, $3, $4, $5)`,
+			id, collection, sealed.KeyID, sealed.WrappedDEK, sealed.Ciphertext); err != nil {
 			return nil, err
 		}
 		for field, value := range it.Indexed {
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO blind_index (collection, field, hash, object_id) VALUES ($1, $2, $3, $4)`,
-				collection, field, s.env.BlindIndex(collection, field, value), id); err != nil {
+				collection, field, s.index.Hash(collection, field, value), id); err != nil {
 				return nil, err
 			}
 		}
@@ -149,7 +188,7 @@ func (s *Store) Get(ctx context.Context, collection, id string) ([]byte, error) 
 // absent from the result.
 func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (map[string][]byte, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, wrapped_dek, ciphertext FROM objects
+		`SELECT id, key_id, wrapped_dek, ciphertext FROM objects
 		 WHERE collection = $1 AND id = ANY($2) AND deleted_at IS NULL`,
 		collection, ids)
 	if err != nil {
@@ -160,7 +199,7 @@ func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (m
 	for rows.Next() {
 		var id string
 		var sealed envelope.Sealed
-		if err := rows.Scan(&id, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
+		if err := rows.Scan(&id, &sealed.KeyID, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
 			return nil, err
 		}
 		plaintext, err := s.env.Open(sealed, aad(collection, id))
@@ -179,7 +218,7 @@ func (s *Store) Search(ctx context.Context, collection, field, normalized string
 		`SELECT object_id FROM blind_index
 		 WHERE collection = $1 AND field = $2 AND hash = $3
 		 ORDER BY object_id LIMIT 100`,
-		collection, field, s.env.BlindIndex(collection, field, normalized))
+		collection, field, s.index.Hash(collection, field, normalized))
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +249,76 @@ func (s *Store) Delete(ctx context.Context, collection, id string) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// Rotate re-wraps the blind-index key and every live per-object key that is
+// not yet under the current master key. Ciphertext is never touched, and
+// rows are handled in pages with no long transaction, so it is safe to run
+// while serving. Rows wrapped by a key this server does not hold are left
+// alone and counted in skipped.
+func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
+	current := s.env.CurrentKeyID()
+
+	var sealed envelope.Sealed
+	if err := s.pool.QueryRow(ctx,
+		`SELECT key_id, wrapped_dek, ciphertext FROM keys WHERE name = $1`, indexKeyName).
+		Scan(&sealed.KeyID, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
+		return 0, 0, err
+	}
+	if re, changed, err := s.env.Rewrap(sealed, indexKeyAAD); err != nil {
+		return 0, 0, fmt.Errorf("blind-index key: %w", err)
+	} else if changed {
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE keys SET key_id = $1, wrapped_dek = $2 WHERE name = $3 AND key_id = $4`,
+			re.KeyID, re.WrappedDEK, indexKeyName, sealed.KeyID); err != nil {
+			return 0, 0, err
+		}
+		rotated++
+	}
+
+	type row struct {
+		ID, Collection, KeyID string
+		WrappedDEK            []byte
+	}
+	last := ""
+	for {
+		rows, err := s.pool.Query(ctx,
+			`SELECT id, collection, key_id, wrapped_dek FROM objects
+			 WHERE deleted_at IS NULL AND key_id <> $1 AND id > $2
+			 ORDER BY id LIMIT 500`,
+			current, last)
+		if err != nil {
+			return rotated, skipped, err
+		}
+		page, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
+		if err != nil {
+			return rotated, skipped, err
+		}
+		if len(page) == 0 {
+			return rotated, skipped, nil
+		}
+		for _, r := range page {
+			last = r.ID
+			re, _, err := s.env.Rewrap(envelope.Sealed{KeyID: r.KeyID, WrappedDEK: r.WrappedDEK}, aad(r.Collection, r.ID))
+			if errors.Is(err, envelope.ErrUnknownKey) {
+				skipped++
+				continue
+			}
+			if err != nil {
+				return rotated, skipped, fmt.Errorf("object %s: %w", r.ID, err)
+			}
+			// deleted_at IS NULL again: never write a key back into a row
+			// that was shredded since it was read.
+			tag, err := s.pool.Exec(ctx,
+				`UPDATE objects SET key_id = $1, wrapped_dek = $2
+				 WHERE id = $3 AND key_id = $4 AND deleted_at IS NULL`,
+				re.KeyID, re.WrappedDEK, r.ID, r.KeyID)
+			if err != nil {
+				return rotated, skipped, err
+			}
+			rotated += int(tag.RowsAffected())
+		}
+	}
 }
 
 // AuditEntry is one line of the audit log. Values never appear in it: only

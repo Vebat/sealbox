@@ -1,10 +1,19 @@
-// Command sealbox runs the vault HTTP server.
+// Command sealbox runs the vault HTTP server, or with the argument "rotate"
+// re-wraps every key under the current master key and exits.
 //
-// Configuration is taken from the environment:
+// Configuration is taken from the environment. Exactly one of these supplies
+// the master keys, as base64, one per line or comma-separated; the first is
+// current, the rest are previous keys still needed to open rows that have
+// not been re-wrapped yet:
 //
-//	SEALBOX_MASTER_KEY     required, 32 random bytes base64-encoded (openssl rand -base64 32)
-//	SEALBOX_KEYS_FILE      JSON file of named clients with keys and roles, see keys.example.json
-//	SEALBOX_API_KEY        one extra key holding every role, for development (openssl rand -base64 32)
+//	SEALBOX_MASTER_KEY          the keys themselves (openssl rand -base64 32)
+//	SEALBOX_MASTER_KEY_FILE     a file with the keys, for Kubernetes and Docker secrets
+//	SEALBOX_MASTER_KEY_COMMAND  a command that prints the keys, for a KMS; runs without a shell
+//
+// And:
+//
+//	SEALBOX_KEYS_FILE      JSON file of named clients with API keys and roles, see keys.example.json
+//	SEALBOX_API_KEY        one extra API key holding every role, for development
 //	SEALBOX_DATABASE_URL   required, Postgres connection string; use sslmode=verify-full
 //	SEALBOX_SCHEMA         optional path to a JSON schema file, see schema.example.json
 //	SEALBOX_ADDR           listen address, default :8080
@@ -21,10 +30,12 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -35,13 +46,27 @@ import (
 )
 
 func main() {
-	masterKey, err := base64.StdEncoding.DecodeString(os.Getenv("SEALBOX_MASTER_KEY"))
-	if err != nil || len(masterKey) != envelope.KeySize {
-		log.Fatal("SEALBOX_MASTER_KEY must be 32 random bytes, base64-encoded: openssl rand -base64 32")
-	}
-	env, err := envelope.New(masterKey)
+	masterKeys, err := loadMasterKeys()
 	if err != nil {
 		log.Fatal(err)
+	}
+	env, err := envelope.New(masterKeys[0], masterKeys[1:]...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("master key %s, %d previous key(s) loaded", env.CurrentKeyID(), len(masterKeys)-1)
+
+	dbURL := os.Getenv("SEALBOX_DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("SEALBOX_DATABASE_URL is required")
+	}
+	if strings.Contains(dbURL, "sslmode=disable") {
+		log.Print("warning: SEALBOX_DATABASE_URL has sslmode=disable; ciphertext and wrapped keys travel to Postgres in the clear")
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == "rotate" {
+		rotate(dbURL, env)
+		return
 	}
 
 	clients, err := api.LoadClients(os.Getenv("SEALBOX_KEYS_FILE"))
@@ -64,14 +89,6 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("schema: %d declared collection(s)", len(sc))
-
-	dbURL := os.Getenv("SEALBOX_DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("SEALBOX_DATABASE_URL is required")
-	}
-	if strings.Contains(dbURL, "sslmode=disable") {
-		log.Print("warning: SEALBOX_DATABASE_URL has sslmode=disable; ciphertext and wrapped keys travel to Postgres in the clear")
-	}
 
 	addr := os.Getenv("SEALBOX_ADDR")
 	if addr == "" {
@@ -118,6 +135,69 @@ func main() {
 	}
 	log.Printf("sealbox listening on %s (plaintext HTTP)", addr)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// rotate re-wraps every key under the current master key. It runs against a
+// live database while the servers keep serving, and exits non-zero if any
+// row was wrapped by a key it does not have.
+func rotate(dbURL string, env *envelope.Envelope) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	st, err := store.Open(ctx, dbURL, env)
+	cancel()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer st.Close()
+	rotated, skipped, err := st.Rotate(context.Background())
+	if err != nil {
+		log.Fatalf("rotate: %v (after %d keys)", err, rotated)
+	}
+	log.Printf("rotate: %d key(s) now under master key %s, %d skipped", rotated, env.CurrentKeyID(), skipped)
+	if skipped > 0 {
+		log.Fatalf("rotate: %d row(s) are wrapped by master keys this process does not have; load them as previous keys and run again", skipped)
+	}
+}
+
+// loadMasterKeys reads the master keys from exactly one source.
+func loadMasterKeys() ([][]byte, error) {
+	var raw string
+	sources := 0
+	if v := os.Getenv("SEALBOX_MASTER_KEY"); v != "" {
+		raw = v
+		sources++
+	}
+	if path := os.Getenv("SEALBOX_MASTER_KEY_FILE"); path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		raw = string(b)
+		sources++
+	}
+	if command := os.Getenv("SEALBOX_MASTER_KEY_COMMAND"); command != "" {
+		args := strings.Fields(command)
+		out, err := exec.Command(args[0], args[1:]...).Output()
+		if err != nil {
+			return nil, errors.New("SEALBOX_MASTER_KEY_COMMAND failed: " + err.Error())
+		}
+		raw = string(out)
+		sources++
+	}
+	if sources != 1 {
+		return nil, errors.New("set exactly one of SEALBOX_MASTER_KEY, SEALBOX_MASTER_KEY_FILE, SEALBOX_MASTER_KEY_COMMAND")
+	}
+	var keys [][]byte
+	for _, field := range strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t' }) {
+		key, err := base64.StdEncoding.DecodeString(field)
+		if err != nil || len(key) != envelope.KeySize {
+			return nil, errors.New("each master key must be 32 random bytes, base64-encoded: openssl rand -base64 32")
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("no master key found")
+	}
+	return keys, nil
 }
 
 // isLoopback reports whether addr binds only to the local machine.

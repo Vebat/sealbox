@@ -6,10 +6,11 @@ If a claim in the README is not backed by a line here, the README is wrong.
 ## Assets
 
 1. **Plaintext personal data** submitted by the application.
-2. **The master key** (`SEALBOX_MASTER_KEY`). Wraps every per-object key.
-3. **Per-object keys (DEKs)**, stored wrapped next to the ciphertext.
-4. **API credentials** that allow reveal.
-5. **The audit log**: who revealed what, when. Holds client names and object ids, never values.
+2. **The master keys**. The current one wraps every new per-object key; previous ones, during a rotation, still open old rows.
+3. **Per-object keys (DEKs)**, stored wrapped next to the ciphertext, each tagged with the fingerprint of the master key that wrapped it.
+4. **The blind-index key**, a service key stored wrapped in the same way.
+5. **API credentials** that allow reveal.
+6. **The audit log**: who revealed what, when. Holds client names and object ids, never values.
 
 ## Trust boundaries
 
@@ -40,13 +41,16 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Nonce reuse | Random 24-byte nonces (XChaCha20) and a fresh key per object. |
 | Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a key derived from the master key with HKDF. Without the master key a dump cannot confirm a guess. |
 | Shredded objects still findable by search | Delete removes the object's index rows in the same transaction that destroys its key. |
+| Master key sitting in the environment | It can come from a file or from a command, so a KMS or secret store hands it over at startup. |
+| A master key that must be retired | Several keys load at once; `sealbox rotate` re-wraps every key in pages while serving. Rotation never writes a key back into a row shredded meanwhile. |
 
 ## Does not protect against
 
 | Threat | Why |
 |---|---|
 | Compromise of the sealbox process or host | The master key is in RAM. Run it isolated, with the least privilege you can. |
-| Theft of the master key from the environment, secret store or KMS | Whoever has it has everything. Guard it like a root credential. |
+| Theft of the master key from the environment, secret store or KMS | Whoever has it has everything. Guard it like a root credential, and rotate as soon as theft is suspected. |
+| Data exposed before a rotation | Rotation re-wraps keys, it does not re-encrypt. The old key together with a dump taken while it was in use still opens those rows. |
 | An application that reveals a value and then leaks it | sealbox limits who can reveal, not what they do afterwards. |
 | Loss of the master key | Every stored value is gone. Back the key up outside the database, and test the restore. |
 | A malicious or buggy sealbox build | Verify releases. Signed builds and an SBOM are on the roadmap; a third-party audit has not happened. |
