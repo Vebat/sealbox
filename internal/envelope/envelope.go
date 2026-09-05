@@ -1,18 +1,23 @@
 // Package envelope implements envelope encryption: every value is encrypted
-// with its own random data-encryption key (DEK), and the DEK is wrapped with
-// a master key (KEK). Deleting the wrapped DEK makes the ciphertext
-// unrecoverable, which is what "delete the key, shred the data" means.
+// with its own random data-encryption key (DEK), and the DEK is wrapped by a
+// wrapping key. Deleting the wrapped DEK makes the ciphertext unrecoverable,
+// which is what "delete the key, shred the data" means.
 //
-// Several master keys may be loaded at once: the current one wraps new keys,
-// previous ones only open rows that have not been re-wrapped yet. Rotation
-// re-wraps DEKs and never touches ciphertext.
+// The wrapping key is held by a Wrapper: Local keeps a master key in this
+// process, Transit and AWSKMS keep it in an external key service and wrap
+// and unwrap over the network, so the process never holds it. Several
+// wrappers may be loaded at once: the current one wraps new keys, previous
+// ones only open rows that have not been re-wrapped yet. Rotation, and
+// migration from one wrapper to another, re-wraps DEKs and never touches
+// ciphertext.
 //
-// No custom cryptography lives here: both layers are XChaCha20-Poly1305 from
-// golang.org/x/crypto with random 24-byte nonces; blind-index hashes and key
-// fingerprints are HMAC-SHA256.
+// No custom cryptography lives here: values and locally wrapped keys use
+// XChaCha20-Poly1305 from golang.org/x/crypto with random 24-byte nonces;
+// blind-index hashes and key fingerprints are HMAC-SHA256.
 package envelope
 
 import (
+	"context"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
@@ -27,83 +32,126 @@ import (
 const KeySize = chacha20poly1305.KeySize
 
 var (
-	// ErrOpen is returned for every failed decryption. The reason is
-	// deliberately not distinguished: a caller must not learn whether the
-	// key, the nonce, the tag or the associated data was wrong.
+	// ErrOpen is returned when a value or a wrapped key fails to open under
+	// the key it names. The reason is deliberately not distinguished: a
+	// caller must not learn whether the key, the nonce, the tag or the
+	// associated data was wrong.
 	ErrOpen = errors.New("envelope: open failed")
-	// ErrUnknownKey means the row names a master key that is not loaded.
+	// ErrUnknownKey means the row names a wrapping key that is not loaded.
 	// Load it as a previous key, or rotate before retiring it.
-	ErrUnknownKey = errors.New("envelope: wrapped by a master key this server does not have")
+	ErrUnknownKey = errors.New("envelope: wrapped by a key this server does not have")
 )
 
-// Sealed is one encrypted value together with everything needed to open it,
-// except the master key. Both byte fields carry their nonce as a prefix.
-//
-// WrappedDEK is the per-object key encrypted under the master key named by
-// KeyID. Setting it to nil is the crypto-shred: Ciphertext can never be
-// opened again.
-type Sealed struct {
-	KeyID      string
-	WrappedDEK []byte
-	Ciphertext []byte
+// Wrapper protects per-object keys under one wrapping key. ID is stored next
+// to every wrapped key as objects.key_id, so rotation knows which rows still
+// need re-wrapping. aad is the row identity; wrappers bind the wrapped key
+// to it where their backend allows. Unwrap returns ErrOpen for a wrapped
+// key that does not open under this key, and any other error for a backend
+// that could not be reached.
+type Wrapper interface {
+	ID() string
+	Wrap(ctx context.Context, dek, aad []byte) ([]byte, error)
+	Unwrap(ctx context.Context, wrapped, aad []byte) ([]byte, error)
 }
 
-// Envelope seals under the current master key and opens under any loaded one.
-type Envelope struct {
-	current string
-	keks    map[string]cipher.AEAD
+// Local wraps with a master key held in this process: XChaCha20-Poly1305
+// with the row identity as associated data.
+type Local struct {
+	id  string
+	kek cipher.AEAD
 }
 
-// New returns an Envelope that seals under masterKey and also opens rows
-// wrapped by any of previous.
-func New(masterKey []byte, previous ...[]byte) (*Envelope, error) {
-	e := &Envelope{keks: map[string]cipher.AEAD{}}
-	for _, key := range append([][]byte{masterKey}, previous...) {
-		kek, err := chacha20poly1305.NewX(key)
-		if err != nil {
-			return nil, err
-		}
-		id := KeyID(key)
-		if e.current == "" {
-			e.current = id
-		}
-		e.keks[id] = kek
+// NewLocal returns a Local wrapper for a 32-byte master key.
+func NewLocal(masterKey []byte) (*Local, error) {
+	kek, err := chacha20poly1305.NewX(masterKey)
+	if err != nil {
+		return nil, err
 	}
-	return e, nil
+	return &Local{id: KeyID(masterKey), kek: kek}, nil
 }
 
-// KeyID is a short fingerprint of a master key. It is stored next to every
-// wrapped key so rotation knows which rows still need re-wrapping. It cannot
-// be turned back into the key.
+// ID is the fingerprint of the master key.
+func (l *Local) ID() string { return l.id }
+
+// Wrap encrypts dek under the master key, bound to aad.
+func (l *Local) Wrap(_ context.Context, dek, aad []byte) ([]byte, error) {
+	return seal(l.kek, dek, aad), nil
+}
+
+// Unwrap is the inverse of Wrap.
+func (l *Local) Unwrap(_ context.Context, wrapped, aad []byte) ([]byte, error) {
+	dek, err := open(l.kek, wrapped, aad)
+	if err != nil {
+		return nil, ErrOpen
+	}
+	return dek, nil
+}
+
+// KeyID is a short fingerprint of a master key. It cannot be turned back
+// into the key.
 func KeyID(masterKey []byte) string {
 	m := hmac.New(sha256.New, masterKey)
 	m.Write([]byte("sealbox/key-id/v1"))
 	return hex.EncodeToString(m.Sum(nil))[:16]
 }
 
-// CurrentKeyID is the fingerprint of the key that wraps new objects.
-func (e *Envelope) CurrentKeyID() string { return e.current }
+// Sealed is one encrypted value together with everything needed to open it,
+// except the wrapping key. Ciphertext carries its nonce as a prefix.
+//
+// WrappedDEK is the per-object key wrapped by the Wrapper named by KeyID.
+// Setting it to nil is the crypto-shred: Ciphertext can never be opened
+// again.
+type Sealed struct {
+	KeyID      string
+	WrappedDEK []byte
+	Ciphertext []byte
+}
 
-// Seal encrypts plaintext under a fresh DEK wrapped by the current master
-// key. aad is authenticated but not encrypted; pass the row identity so a
+// Envelope seals under the current wrapper and opens under any loaded one.
+type Envelope struct {
+	current Wrapper
+	all     map[string]Wrapper
+}
+
+// New returns an Envelope that seals under current and also opens rows
+// wrapped by any of previous.
+func New(current Wrapper, previous ...Wrapper) *Envelope {
+	e := &Envelope{current: current, all: map[string]Wrapper{current.ID(): current}}
+	for _, w := range previous {
+		if _, dup := e.all[w.ID()]; !dup {
+			e.all[w.ID()] = w
+		}
+	}
+	return e
+}
+
+// CurrentKeyID is the id of the wrapper that wraps new objects.
+func (e *Envelope) CurrentKeyID() string { return e.current.ID() }
+
+// Seal encrypts plaintext under a fresh DEK wrapped by the current wrapper.
+// aad is authenticated but not encrypted; pass the row identity so a
 // ciphertext cannot be moved to another row without failing to open.
-func (e *Envelope) Seal(plaintext, aad []byte) (Sealed, error) {
+func (e *Envelope) Seal(ctx context.Context, plaintext, aad []byte) (Sealed, error) {
 	dek := make([]byte, KeySize)
 	rand.Read(dek)
 	dataAEAD, err := chacha20poly1305.NewX(dek)
 	if err != nil {
 		return Sealed{}, err
 	}
+	wrapped, err := e.current.Wrap(ctx, dek, aad)
+	if err != nil {
+		return Sealed{}, err
+	}
 	return Sealed{
-		KeyID:      e.current,
-		WrappedDEK: seal(e.keks[e.current], dek, aad),
+		KeyID:      e.current.ID(),
+		WrappedDEK: wrapped,
 		Ciphertext: seal(dataAEAD, plaintext, aad),
 	}, nil
 }
 
 // Open decrypts s. aad must equal the value passed to Seal.
-func (e *Envelope) Open(s Sealed, aad []byte) ([]byte, error) {
-	dek, err := e.unwrap(s, aad)
+func (e *Envelope) Open(ctx context.Context, s Sealed, aad []byte) ([]byte, error) {
+	dek, err := e.unwrap(ctx, s, aad)
 	if err != nil {
 		return nil, err
 	}
@@ -118,32 +166,36 @@ func (e *Envelope) Open(s Sealed, aad []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-// Rewrap returns s with its per-object key wrapped under the current master
-// key. Ciphertext is carried over untouched and may be nil. The bool
-// reports whether anything changed.
-func (e *Envelope) Rewrap(s Sealed, aad []byte) (Sealed, bool, error) {
-	if s.KeyID == e.current {
+// Rewrap returns s with its per-object key wrapped by the current wrapper.
+// Ciphertext is carried over untouched and may be nil. The bool reports
+// whether anything changed. Moving from one wrapper to another, for example
+// from a local master key to a KMS, is the same operation.
+func (e *Envelope) Rewrap(ctx context.Context, s Sealed, aad []byte) (Sealed, bool, error) {
+	if s.KeyID == e.current.ID() {
 		return s, false, nil
 	}
-	dek, err := e.unwrap(s, aad)
+	dek, err := e.unwrap(ctx, s, aad)
 	if err != nil {
 		return Sealed{}, false, err
 	}
-	return Sealed{
-		KeyID:      e.current,
-		WrappedDEK: seal(e.keks[e.current], dek, aad),
-		Ciphertext: s.Ciphertext,
-	}, true, nil
+	wrapped, err := e.current.Wrap(ctx, dek, aad)
+	if err != nil {
+		return Sealed{}, false, err
+	}
+	return Sealed{KeyID: e.current.ID(), WrappedDEK: wrapped, Ciphertext: s.Ciphertext}, true, nil
 }
 
-// unwrap recovers the DEK under the master key named by s.KeyID.
-func (e *Envelope) unwrap(s Sealed, aad []byte) ([]byte, error) {
-	kek, ok := e.keks[s.KeyID]
+// unwrap recovers the DEK through the wrapper named by s.KeyID.
+func (e *Envelope) unwrap(ctx context.Context, s Sealed, aad []byte) ([]byte, error) {
+	w, ok := e.all[s.KeyID]
 	if !ok {
 		return nil, ErrUnknownKey
 	}
-	dek, err := open(kek, s.WrappedDEK, aad)
+	dek, err := w.Unwrap(ctx, s.WrappedDEK, aad)
 	if err != nil {
+		return nil, err
+	}
+	if len(dek) != KeySize {
 		return nil, ErrOpen
 	}
 	return dek, nil
@@ -166,8 +218,8 @@ func open(aead cipher.AEAD, blob, aad []byte) ([]byte, error) {
 }
 
 // Index computes blind-index hashes under a dedicated key. The key lives in
-// the database wrapped like any per-object key, so master key rotation
-// re-wraps it and never changes a hash.
+// the database wrapped like any per-object key, so key rotation re-wraps it
+// and never changes a hash.
 type Index struct {
 	key []byte
 }

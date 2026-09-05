@@ -161,6 +161,27 @@ or have an init container fetch the key into a file and use `SEALBOX_MASTER_KEY_
 Losing the master key loses every object. Back it up outside the database and test the restore.
 sealbox logs the fingerprint of the current key at startup.
 
+### Keeping the master key out of the process
+
+With a local master key, whoever controls the sealbox process holds every key. `SEALBOX_KMS` moves the
+wrapping key into a key service: sealbox sends each per-object key there to be wrapped and asks for it back
+to be unwrapped, one call per object, and never sees the master key. A compromised process can then only
+unwrap keys while it is compromised, one at a time, each call logged by the key service and revocable there.
+
+| `SEALBOX_KMS` | Backend | Configuration |
+|---|---|---|
+| `local` (default) | this process | `SEALBOX_MASTER_KEY`, `_FILE` or `_COMMAND` |
+| `transit` | HashiCorp Vault or OpenBao transit engine | `SEALBOX_TRANSIT_ADDR`, `SEALBOX_TRANSIT_KEY`, `SEALBOX_TRANSIT_TOKEN` or `SEALBOX_TRANSIT_TOKEN_FILE`, `SEALBOX_TRANSIT_MOUNT` (default `transit`) |
+| `awskms` | AWS KMS | `SEALBOX_AWSKMS_KEY` (id, ARN or alias) and the standard AWS credential and region environment |
+
+Create the transit key with `derived=true` and the engine also binds every wrapped key to its row. AWS KMS does the
+same through the encryption context. AWS support is compiled in only with `go build -tags awskms`, or
+`docker build --build-arg TAGS=awskms`, because it brings the AWS SDK; the default binary carries neither.
+
+Moving an existing database to a key service is a rotation: set `SEALBOX_KMS`, keep the master key configured so
+it opens the old rows, restart, run `sealbox rotate`, then drop the master key. Every wrap and unwrap is a network
+call, so expect a few milliseconds per object on reads.
+
 ### Rotation
 
 Rotation re-wraps keys, it does not re-encrypt data, so it runs while the service is up.
@@ -297,7 +318,8 @@ Not built yet, in the order they are likely to matter:
 - [x] Audit log: every create, reveal, search and delete, written before the data leaves
 - [x] Batch create, atomic up to 1000 objects, and batch reveal with per-object audit
 - [x] OpenAPI spec, served at /openapi.json and tested against the routes; Go client package
-- [x] Master key from a file or a command (KMS); rotation by re-wrapping, while serving
+- [x] Master key from a file or a command; rotation by re-wrapping, while serving
+- [x] Wrapping key in a key service: Vault and OpenBao transit, AWS KMS; migration by rotation
 
 ## Design rules
 
@@ -331,12 +353,13 @@ carries a license outside Apache-2.0, BSD, MIT or ISC.
 | github.com/jackc/tern/v2 | MIT | SQL migrations with an advisory lock |
 
 The full transitive list: `go run github.com/google/go-licenses@v1.6.0 report ./...`.
+Builds with `-tags awskms` add the AWS SDK for Go v2, Apache-2.0, and its modules.
 
 ## Development
 
 ```sh
 docker compose up -d postgres
-SEALBOX_TEST_DATABASE_URL=postgres://sealbox:sealbox@localhost:5432/sealbox?sslmode=disable go test -race ./...
+SEALBOX_TEST_DATABASE_URL=postgres://sealbox:sealbox@localhost:5430/sealbox?sslmode=disable go test -race ./...
 ```
 
 Store tests are skipped when `SEALBOX_TEST_DATABASE_URL` is not set. CI runs them against a Postgres service.

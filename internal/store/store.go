@@ -99,7 +99,7 @@ func migrateUp(ctx context.Context, pool *pgxpool.Pool) error {
 func loadIndexKey(ctx context.Context, pool *pgxpool.Pool, env *envelope.Envelope) (*envelope.Index, error) {
 	candidate := make([]byte, envelope.KeySize)
 	rand.Read(candidate)
-	sealed, err := env.Seal(candidate, indexKeyAAD)
+	sealed, err := env.Seal(ctx, candidate, indexKeyAAD)
 	if err != nil {
 		return nil, err
 	}
@@ -114,9 +114,9 @@ func loadIndexKey(ctx context.Context, pool *pgxpool.Pool, env *envelope.Envelop
 		Scan(&sealed.KeyID, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
 		return nil, err
 	}
-	key, err := env.Open(sealed, indexKeyAAD)
+	key, err := env.Open(ctx, sealed, indexKeyAAD)
 	if err != nil {
-		return nil, fmt.Errorf("wrapped by master key %s: %w", sealed.KeyID, err)
+		return nil, fmt.Errorf("wrapped by key %s: %w", sealed.KeyID, err)
 	}
 	return envelope.NewIndex(key)
 }
@@ -147,7 +147,7 @@ func (s *Store) PutMany(ctx context.Context, actor, collection string, items []I
 	ids := make([]string, 0, len(items))
 	for _, it := range items {
 		id := newID()
-		sealed, err := s.env.Seal(it.Plaintext, aad(collection, id))
+		sealed, err := s.env.Seal(ctx, it.Plaintext, aad(collection, id))
 		if err != nil {
 			return nil, err
 		}
@@ -194,7 +194,7 @@ func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (m
 		if err := rows.Scan(&id, &sealed.KeyID, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
 			return nil, err
 		}
-		plaintext, err := s.env.Open(sealed, aad(collection, id))
+		plaintext, err := s.env.Open(ctx, sealed, aad(collection, id))
 		if err != nil {
 			return nil, fmt.Errorf("object %s: %w", id, err)
 		}
@@ -248,12 +248,14 @@ func (s *Store) Delete(ctx context.Context, actor, collection, id string) error 
 }
 
 // Rotate re-wraps the blind-index key and every live per-object key that is
-// not yet under the current master key. Ciphertext is never touched, and
-// rows are handled in pages with no long transaction, so it is safe to run
-// while serving. Rows that cannot be re-wrapped, because they name a master
-// key this server does not hold or because they no longer open at all, are
-// logged by id, counted in skipped, and left as they are: one bad row must
-// not block the rotation of every other.
+// not yet under the current wrapping key, which is also how a database
+// moves from a local master key to a key service. Ciphertext is never
+// touched, and rows are handled in pages with no long transaction, so it
+// is safe to run while serving. Rows that cannot be re-wrapped, because
+// they name a key this server does not hold or because they no longer open
+// at all, are logged by id, counted in skipped, and left as they are: one
+// bad row must not block the rotation of every other. A key service that
+// cannot be reached stops the run instead.
 func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
 	current := s.env.CurrentKeyID()
 
@@ -263,7 +265,7 @@ func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
 		Scan(&sealed.KeyID, &sealed.WrappedDEK, &sealed.Ciphertext); err != nil {
 		return 0, 0, err
 	}
-	if re, changed, err := s.env.Rewrap(sealed, indexKeyAAD); err != nil {
+	if re, changed, err := s.env.Rewrap(ctx, sealed, indexKeyAAD); err != nil {
 		return 0, 0, fmt.Errorf("blind-index key: %w", err)
 	} else if changed {
 		tag, err := s.pool.Exec(ctx,
@@ -298,11 +300,15 @@ func (s *Store) Rotate(ctx context.Context) (rotated, skipped int, err error) {
 		}
 		for _, r := range page {
 			last = r.ID
-			re, _, err := s.env.Rewrap(envelope.Sealed{KeyID: r.KeyID, WrappedDEK: r.WrappedDEK}, aad(r.Collection, r.ID))
-			if err != nil {
+			re, _, err := s.env.Rewrap(ctx, envelope.Sealed{KeyID: r.KeyID, WrappedDEK: r.WrappedDEK}, aad(r.Collection, r.ID))
+			if errors.Is(err, envelope.ErrOpen) || errors.Is(err, envelope.ErrUnknownKey) {
 				log.Printf("store: rotate: skipping object %s: %v", r.ID, err)
 				skipped++
 				continue
+			}
+			if err != nil {
+				// A key service that cannot be reached is not a bad row.
+				return rotated, skipped, fmt.Errorf("object %s: %w", r.ID, err)
 			}
 			// deleted_at IS NULL again: never write a key back into a row
 			// that was shredded since it was read.

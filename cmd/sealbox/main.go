@@ -1,16 +1,24 @@
 // Command sealbox runs the vault HTTP server, or with the argument "rotate"
-// re-wraps every key under the current master key and exits.
+// re-wraps every key under the current wrapping key and exits.
 //
-// Configuration is taken from the environment. Exactly one of these supplies
-// the master keys, as base64, one per line or comma-separated; the first is
-// current, the rest are previous keys still needed to open rows that have
-// not been re-wrapped yet:
+// Configuration is taken from the environment.
 //
-//	SEALBOX_MASTER_KEY          the keys themselves (openssl rand -base64 32)
-//	SEALBOX_MASTER_KEY_FILE     a file with the keys, for Kubernetes and Docker secrets
-//	SEALBOX_MASTER_KEY_COMMAND  a command that prints the keys, for a KMS; runs without a shell
+// The wrapping key. SEALBOX_KMS selects where it lives:
 //
-// And:
+//	local (default)  a master key held by this process, from exactly one of
+//	                 SEALBOX_MASTER_KEY, SEALBOX_MASTER_KEY_FILE, SEALBOX_MASTER_KEY_COMMAND
+//	transit          the transit engine of Vault or OpenBao: SEALBOX_TRANSIT_ADDR, SEALBOX_TRANSIT_KEY,
+//	                 SEALBOX_TRANSIT_TOKEN or SEALBOX_TRANSIT_TOKEN_FILE, SEALBOX_TRANSIT_MOUNT (default transit)
+//	awskms           AWS KMS, in binaries built with -tags awskms: SEALBOX_AWSKMS_KEY, the standard
+//	                 AWS credential and region environment, SEALBOX_AWSKMS_ENDPOINT for emulators
+//
+// Master keys are base64, one per line or comma-separated. Under local the
+// first is current and the rest are previous keys still needed to open rows
+// that have not been re-wrapped. Under transit or awskms every master key
+// given is a previous key, which is how a database migrates to a key
+// service: set SEALBOX_KMS, keep the master key, run "sealbox rotate", drop it.
+//
+// Everything else:
 //
 //	SEALBOX_KEYS_FILE      JSON file of named clients with API keys and roles, see keys.example.json
 //	SEALBOX_API_KEY        one extra API key holding every role, for development
@@ -28,9 +36,11 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -46,15 +56,13 @@ import (
 )
 
 func main() {
-	masterKeys, err := loadMasterKeys()
+	ctx := context.Background()
+	wrappers, err := loadWrappers(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	env, err := envelope.New(masterKeys[0], masterKeys[1:]...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("master key %s, %d previous key(s) loaded", env.CurrentKeyID(), len(masterKeys)-1)
+	env := envelope.New(wrappers[0], wrappers[1:]...)
+	log.Printf("wrapping key %s, %d previous key(s) loaded", env.CurrentKeyID(), len(wrappers)-1)
 
 	dbURL := os.Getenv("SEALBOX_DATABASE_URL")
 	if dbURL == "" {
@@ -103,8 +111,8 @@ func main() {
 		log.Fatalf("refusing plaintext HTTP on %s: set SEALBOX_TLS_CERT and SEALBOX_TLS_KEY, or SEALBOX_INSECURE_HTTP=1 if TLS is terminated in front of sealbox", addr)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	st, err := store.Open(ctx, dbURL, env)
+	openCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	st, err := store.Open(openCtx, dbURL, env)
 	cancel()
 	if err != nil {
 		log.Fatal(err)
@@ -140,9 +148,9 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-// rotate re-wraps every key under the current master key. It runs against a
-// live database while the servers keep serving, and exits non-zero if any
-// row was wrapped by a key it does not have.
+// rotate re-wraps every key under the current wrapping key. It runs against
+// a live database while the servers keep serving, and exits non-zero if any
+// row could not be re-wrapped.
 func rotate(dbURL string, env *envelope.Envelope) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	st, err := store.Open(ctx, dbURL, env)
@@ -155,13 +163,71 @@ func rotate(dbURL string, env *envelope.Envelope) {
 	if err != nil {
 		log.Fatalf("rotate: %v (after %d keys)", err, rotated)
 	}
-	log.Printf("rotate: %d key(s) now under master key %s, %d skipped", rotated, env.CurrentKeyID(), skipped)
+	log.Printf("rotate: %d key(s) now under %s, %d skipped", rotated, env.CurrentKeyID(), skipped)
 	if skipped > 0 {
-		log.Fatalf("rotate: %d row(s) could not be re-wrapped, see the lines above: load missing master keys as previous keys and run again, or investigate rows that no longer open", skipped)
+		log.Fatalf("rotate: %d row(s) could not be re-wrapped, see the lines above: load missing keys as previous keys and run again, or investigate rows that no longer open", skipped)
 	}
 }
 
-// loadMasterKeys reads the master keys from exactly one source.
+// loadWrappers returns the wrapping keys, current first. SEALBOX_KMS picks
+// where the current one lives; local master keys, when given, come after it
+// as previous keys.
+func loadWrappers(ctx context.Context) ([]envelope.Wrapper, error) {
+	keys, err := loadMasterKeys()
+	if err != nil {
+		return nil, err
+	}
+	var local []envelope.Wrapper
+	for _, key := range keys {
+		w, err := envelope.NewLocal(key)
+		if err != nil {
+			return nil, err
+		}
+		local = append(local, w)
+	}
+	switch kms := os.Getenv("SEALBOX_KMS"); kms {
+	case "", "local":
+		if len(local) == 0 {
+			return nil, errors.New("no master key: set SEALBOX_MASTER_KEY, SEALBOX_MASTER_KEY_FILE or SEALBOX_MASTER_KEY_COMMAND")
+		}
+		return local, nil
+	case "transit":
+		addr, key := os.Getenv("SEALBOX_TRANSIT_ADDR"), os.Getenv("SEALBOX_TRANSIT_KEY")
+		if addr == "" || key == "" {
+			return nil, errors.New("SEALBOX_KMS=transit needs SEALBOX_TRANSIT_ADDR and SEALBOX_TRANSIT_KEY")
+		}
+		token, err := secret("SEALBOX_TRANSIT_TOKEN")
+		if err != nil {
+			return nil, err
+		}
+		mount := cmp.Or(os.Getenv("SEALBOX_TRANSIT_MOUNT"), "transit")
+		return append([]envelope.Wrapper{envelope.NewTransit(addr, mount, key, token)}, local...), nil
+	case "awskms":
+		w, err := envelope.NewAWSKMS(ctx, os.Getenv("SEALBOX_AWSKMS_KEY"), os.Getenv("SEALBOX_AWSKMS_ENDPOINT"))
+		if err != nil {
+			return nil, err
+		}
+		return append([]envelope.Wrapper{w}, local...), nil
+	default:
+		return nil, fmt.Errorf("SEALBOX_KMS=%q: expected local, transit or awskms", kms)
+	}
+}
+
+// secret reads NAME, or the file named by NAME_FILE.
+func secret(name string) (string, error) {
+	if v := os.Getenv(name); v != "" {
+		return v, nil
+	}
+	if path := os.Getenv(name + "_FILE"); path != "" {
+		b, err := os.ReadFile(path)
+		return strings.TrimSpace(string(b)), err
+	}
+	return "", fmt.Errorf("%s or %s_FILE is required", name, name)
+}
+
+// loadMasterKeys reads local master keys from at most one source. No source
+// at all yields no keys, which is fine when a key service holds the current
+// key.
 func loadMasterKeys() ([][]byte, error) {
 	var raw string
 	sources := 0
@@ -180,8 +246,8 @@ func loadMasterKeys() ([][]byte, error) {
 	if command := os.Getenv("SEALBOX_MASTER_KEY_COMMAND"); strings.TrimSpace(command) != "" {
 		args := strings.Fields(command)
 		cmd := exec.Command(args[0], args[1:]...)
-		// The command gets the environment it needs to reach the KMS, but
-		// not sealbox's own secrets.
+		// The command gets the environment it needs to reach its backend,
+		// but not sealbox's own secrets.
 		for _, kv := range os.Environ() {
 			if !strings.HasPrefix(kv, "SEALBOX_") {
 				cmd.Env = append(cmd.Env, kv)
@@ -194,8 +260,11 @@ func loadMasterKeys() ([][]byte, error) {
 		raw = string(out)
 		sources++
 	}
-	if sources != 1 {
-		return nil, errors.New("set exactly one of SEALBOX_MASTER_KEY, SEALBOX_MASTER_KEY_FILE, SEALBOX_MASTER_KEY_COMMAND")
+	switch {
+	case sources == 0:
+		return nil, nil
+	case sources > 1:
+		return nil, errors.New("set at most one of SEALBOX_MASTER_KEY, SEALBOX_MASTER_KEY_FILE, SEALBOX_MASTER_KEY_COMMAND")
 	}
 	var keys [][]byte
 	for _, field := range strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '\r' || r == ',' || r == ' ' || r == '\t' }) {
@@ -206,7 +275,7 @@ func loadMasterKeys() ([][]byte, error) {
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		return nil, errors.New("no master key found")
+		return nil, errors.New("the master key source is set but holds no key")
 	}
 	return keys, nil
 }

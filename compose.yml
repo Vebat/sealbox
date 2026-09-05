@@ -1,6 +1,7 @@
 # Local development only. Credentials below are throwaway, and both ports are
-# bound to localhost. To start over with a fresh database and a new master
-# key: docker compose down -v
+# bound to localhost. Postgres is published on 5430 so it does not collide
+# with a Postgres already installed on the machine. To start over with a
+# fresh database and a new master key: docker compose down -v
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,7 +9,7 @@ services:
       POSTGRES_USER: sealbox
       POSTGRES_PASSWORD: sealbox
       POSTGRES_DB: sealbox
-    ports: ["127.0.0.1:5432:5432"]
+    ports: ["127.0.0.1:5430:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "sealbox"]

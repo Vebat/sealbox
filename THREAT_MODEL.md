@@ -42,14 +42,15 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Testing guesses against the search index from a dump | The blind index is HMAC-SHA256 under a random index key that is stored wrapped by the master key. Without the master key a dump cannot confirm a guess. |
 | Reading a service key through the object API | Service keys and objects are sealed in separate AAD namespaces, and ids are validated: a keys row copied into the objects table does not open. |
 | Shredded objects still findable by search | Delete removes the object's index rows in the same transaction that destroys its key. |
-| Master key sitting in the environment | It can come from a file or from a command, so a KMS or secret store hands it over at startup. |
+| Master key sitting in the environment | It can come from a file or from a command, so a secret store hands it over at startup. |
+| Master key sitting in the process at all | With `SEALBOX_KMS=transit` or `awskms` the wrapping key stays in the key service; sealbox only ever holds per-object keys, and only while using them. |
 | A master key that must be retired | Several keys load at once; `sealbox rotate` re-wraps every key in pages while serving. Rotation never writes a key back into a row shredded meanwhile. |
 
 ## Does not protect against
 
 | Threat | Why |
 |---|---|
-| Compromise of the sealbox process or host | The master key is in RAM. Run it isolated, with the least privilege you can. |
+| Compromise of the sealbox process or host | With a local master key it is in RAM and the attacker has everything. With a key service (`SEALBOX_KMS`) the process holds no master key: the attacker can only unwrap keys while present, one call each, logged and revocable at the service. Run sealbox isolated, with the least privilege you can. |
 | Theft of the master key from the environment, secret store or KMS | Whoever has it has everything. Guard it like a root credential, and rotate as soon as theft is suspected. |
 | Data exposed before a rotation | Rotation re-wraps keys, it does not re-encrypt. The old key together with a dump taken while it was in use still opens those rows. |
 | A backup taken before an erasure, held with the master key that was current then | The backup carries the wrapped DEK next to the ciphertext. Rotate the master key and destroy the retired one; every backup older than that rotation is then dead for every object erased before it. Schedule rotations to match your erasure promises. |

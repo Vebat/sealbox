@@ -2,10 +2,14 @@ package envelope
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"testing"
 )
+
+var ctx = context.Background()
 
 func randomKey(t *testing.T) []byte {
 	t.Helper()
@@ -14,13 +18,22 @@ func randomKey(t *testing.T) []byte {
 	return key
 }
 
-func mustNew(t *testing.T, current []byte, previous ...[]byte) *Envelope {
+func local(t *testing.T, key []byte) *Local {
 	t.Helper()
-	e, err := New(current, previous...)
+	w, err := NewLocal(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return e
+	return w
+}
+
+func mustNew(t *testing.T, current []byte, previous ...[]byte) *Envelope {
+	t.Helper()
+	ws := make([]Wrapper, 0, len(previous))
+	for _, k := range previous {
+		ws = append(ws, local(t, k))
+	}
+	return New(local(t, current), ws...)
 }
 
 func newEnvelope(t *testing.T) *Envelope {
@@ -30,7 +43,7 @@ func newEnvelope(t *testing.T) *Envelope {
 
 func mustSeal(t *testing.T, e *Envelope, plaintext, aad string) Sealed {
 	t.Helper()
-	s, err := e.Seal([]byte(plaintext), []byte(aad))
+	s, err := e.Seal(ctx, []byte(plaintext), []byte(aad))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +56,7 @@ func TestRoundtrip(t *testing.T) {
 	if s.KeyID != e.CurrentKeyID() {
 		t.Fatalf("sealed under %q, current is %q", s.KeyID, e.CurrentKeyID())
 	}
-	got, err := e.Open(s, []byte("customers/obj-1"))
+	got, err := e.Open(ctx, s, []byte("customers/obj-1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +68,7 @@ func TestRoundtrip(t *testing.T) {
 func TestEmptyPlaintext(t *testing.T) {
 	e := newEnvelope(t)
 	s := mustSeal(t, e, "", "x")
-	got, err := e.Open(s, []byte("x"))
+	got, err := e.Open(ctx, s, []byte("x"))
 	if err != nil || len(got) != 0 {
 		t.Fatalf("got %q, %v", got, err)
 	}
@@ -67,7 +80,7 @@ func TestShredded(t *testing.T) {
 	e := newEnvelope(t)
 	s := mustSeal(t, e, "secret", "x")
 	s.WrappedDEK = nil
-	if _, err := e.Open(s, []byte("x")); !errors.Is(err, ErrOpen) {
+	if _, err := e.Open(ctx, s, []byte("x")); !errors.Is(err, ErrOpen) {
 		t.Fatalf("expected ErrOpen, got %v", err)
 	}
 }
@@ -76,7 +89,7 @@ func TestTamperedCiphertext(t *testing.T) {
 	e := newEnvelope(t)
 	s := mustSeal(t, e, "secret", "x")
 	s.Ciphertext[len(s.Ciphertext)-1] ^= 1
-	if _, err := e.Open(s, []byte("x")); !errors.Is(err, ErrOpen) {
+	if _, err := e.Open(ctx, s, []byte("x")); !errors.Is(err, ErrOpen) {
 		t.Fatalf("expected ErrOpen, got %v", err)
 	}
 }
@@ -85,7 +98,7 @@ func TestTamperedWrappedDEK(t *testing.T) {
 	e := newEnvelope(t)
 	s := mustSeal(t, e, "secret", "x")
 	s.WrappedDEK[len(s.WrappedDEK)-1] ^= 1
-	if _, err := e.Open(s, []byte("x")); !errors.Is(err, ErrOpen) {
+	if _, err := e.Open(ctx, s, []byte("x")); !errors.Is(err, ErrOpen) {
 		t.Fatalf("expected ErrOpen, got %v", err)
 	}
 }
@@ -94,14 +107,14 @@ func TestWrongAAD(t *testing.T) {
 	// A ciphertext moved to another record must not open there.
 	e := newEnvelope(t)
 	s := mustSeal(t, e, "secret", "customers/obj-1")
-	if _, err := e.Open(s, []byte("customers/obj-2")); !errors.Is(err, ErrOpen) {
+	if _, err := e.Open(ctx, s, []byte("customers/obj-2")); !errors.Is(err, ErrOpen) {
 		t.Fatalf("expected ErrOpen, got %v", err)
 	}
 }
 
 func TestWrongMasterKey(t *testing.T) {
 	s := mustSeal(t, newEnvelope(t), "secret", "x")
-	if _, err := newEnvelope(t).Open(s, []byte("x")); !errors.Is(err, ErrUnknownKey) {
+	if _, err := newEnvelope(t).Open(ctx, s, []byte("x")); !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("expected ErrUnknownKey, got %v", err)
 	}
 }
@@ -116,11 +129,8 @@ func TestFreshKeyPerSeal(t *testing.T) {
 }
 
 func TestBadMasterKeySize(t *testing.T) {
-	if _, err := New(make([]byte, 16)); err == nil {
+	if _, err := NewLocal(make([]byte, 16)); err == nil {
 		t.Fatal("expected error for 16-byte master key")
-	}
-	if _, err := New(randomKey(t), make([]byte, 16)); err == nil {
-		t.Fatal("expected error for 16-byte previous key")
 	}
 }
 
@@ -141,30 +151,30 @@ func TestRotation(t *testing.T) {
 	if both.CurrentKeyID() != KeyID(b) {
 		t.Fatal("first key must be current")
 	}
-	if got, err := both.Open(s, []byte("x")); err != nil || string(got) != "secret" {
+	if got, err := both.Open(ctx, s, []byte("x")); err != nil || string(got) != "secret" {
 		t.Fatalf("open old row during rotation: %q, %v", got, err)
 	}
 
-	re, changed, err := both.Rewrap(s, []byte("x"))
+	re, changed, err := both.Rewrap(ctx, s, []byte("x"))
 	if err != nil || !changed || re.KeyID != KeyID(b) || !bytes.Equal(re.Ciphertext, s.Ciphertext) {
 		t.Fatalf("rewrap: changed=%v key=%q err=%v", changed, re.KeyID, err)
 	}
-	if _, changed, _ := both.Rewrap(re, []byte("x")); changed {
+	if _, changed, _ := both.Rewrap(ctx, re, []byte("x")); changed {
 		t.Fatal("rewrap of a current row must be a no-op")
 	}
-	if _, _, err := both.Rewrap(s, []byte("other")); !errors.Is(err, ErrOpen) {
+	if _, _, err := both.Rewrap(ctx, s, []byte("other")); !errors.Is(err, ErrOpen) {
 		t.Fatalf("rewrap with wrong aad: %v", err)
 	}
 
 	// After rotation the old key can be retired.
 	fresh := mustNew(t, b)
-	if got, err := fresh.Open(re, []byte("x")); err != nil || string(got) != "secret" {
+	if got, err := fresh.Open(ctx, re, []byte("x")); err != nil || string(got) != "secret" {
 		t.Fatalf("open rewrapped row with new key only: %q, %v", got, err)
 	}
-	if _, err := fresh.Open(s, []byte("x")); !errors.Is(err, ErrUnknownKey) {
+	if _, err := fresh.Open(ctx, s, []byte("x")); !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("old row with new key only: expected ErrUnknownKey, got %v", err)
 	}
-	if _, _, err := fresh.Rewrap(s, []byte("x")); !errors.Is(err, ErrUnknownKey) {
+	if _, _, err := fresh.Rewrap(ctx, s, []byte("x")); !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("rewrap without the old key: expected ErrUnknownKey, got %v", err)
 	}
 }
@@ -174,8 +184,63 @@ func TestRewrapShredded(t *testing.T) {
 	a, b := randomKey(t), randomKey(t)
 	s := mustSeal(t, mustNew(t, a), "secret", "x")
 	s.WrappedDEK = nil
-	if _, _, err := mustNew(t, b, a).Rewrap(s, []byte("x")); !errors.Is(err, ErrOpen) {
+	if _, _, err := mustNew(t, b, a).Rewrap(ctx, s, []byte("x")); !errors.Is(err, ErrOpen) {
 		t.Fatalf("expected ErrOpen, got %v", err)
+	}
+}
+
+// memWrapper stands in for a key service: it keeps the wrapped keys itself
+// and hands one back only with the aad it was wrapped with.
+type memWrapper struct {
+	id   string
+	keys map[string]struct{ dek, aad []byte }
+}
+
+func newMemWrapper(id string) *memWrapper {
+	return &memWrapper{id: id, keys: map[string]struct{ dek, aad []byte }{}}
+}
+
+func (m *memWrapper) ID() string { return m.id }
+
+func (m *memWrapper) Wrap(_ context.Context, dek, aad []byte) ([]byte, error) {
+	ref := make([]byte, 8)
+	rand.Read(ref)
+	m.keys[hex.EncodeToString(ref)] = struct{ dek, aad []byte }{bytes.Clone(dek), bytes.Clone(aad)}
+	return []byte(hex.EncodeToString(ref)), nil
+}
+
+func (m *memWrapper) Unwrap(_ context.Context, wrapped, aad []byte) ([]byte, error) {
+	k, ok := m.keys[string(wrapped)]
+	if !ok || !bytes.Equal(k.aad, aad) {
+		return nil, ErrOpen
+	}
+	return k.dek, nil
+}
+
+func TestMigrateBetweenWrappers(t *testing.T) {
+	// From a local master key to a key service and back: the same rewrap.
+	key := randomKey(t)
+	s := mustSeal(t, mustNew(t, key), "secret", "x")
+
+	kms := newMemWrapper("kms:test")
+	migrating := New(kms, local(t, key))
+	re, changed, err := migrating.Rewrap(ctx, s, []byte("x"))
+	if err != nil || !changed || re.KeyID != "kms:test" {
+		t.Fatalf("to kms: changed=%v key=%q err=%v", changed, re.KeyID, err)
+	}
+	if got, err := New(kms).Open(ctx, re, []byte("x")); err != nil || string(got) != "secret" {
+		t.Fatalf("open with kms only: %q, %v", got, err)
+	}
+	if _, err := New(kms).Open(ctx, re, []byte("other")); !errors.Is(err, ErrOpen) {
+		t.Fatalf("kms must honour aad: %v", err)
+	}
+
+	back, changed, err := New(local(t, key), kms).Rewrap(ctx, re, []byte("x"))
+	if err != nil || !changed || back.KeyID != KeyID(key) {
+		t.Fatalf("back to local: changed=%v key=%q err=%v", changed, back.KeyID, err)
+	}
+	if got, err := mustNew(t, key).Open(ctx, back, []byte("x")); err != nil || string(got) != "secret" {
+		t.Fatalf("open with local only: %q, %v", got, err)
 	}
 }
 

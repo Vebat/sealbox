@@ -22,7 +22,12 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
+      - name: AWS KMS build tag
+        run: |
+          go vet -tags awskms ./...
+          go test -race -tags awskms ./internal/envelope/
+          go build -tags awskms ./cmd/sealbox
       - name: dependency licenses
-        run: go run github.com/google/go-licenses@v1.6.0 check ./... --allowed_licenses=Apache-2.0,BSD-2-Clause,BSD-3-Clause,MIT,ISC
+        run: GOFLAGS=-tags=awskms go run github.com/google/go-licenses@v1.6.0 check ./... --allowed_licenses=Apache-2.0,BSD-2-Clause,BSD-3-Clause,MIT,ISC
       - name: container image builds
         run: docker build -t sealbox:ci .

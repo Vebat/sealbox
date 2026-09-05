@@ -37,13 +37,27 @@ func testDatabaseURL(t *testing.T) string {
 	return url
 }
 
-func openStore(t *testing.T, current []byte, previous ...[]byte) *Store {
+// localEnvelope builds an Envelope over local master keys, current first.
+func localEnvelope(t *testing.T, current []byte, previous ...[]byte) *envelope.Envelope {
 	t.Helper()
-	env, err := envelope.New(current, previous...)
+	cur, err := envelope.NewLocal(current)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(context.Background(), testDatabaseURL(t), env)
+	var prev []envelope.Wrapper
+	for _, key := range previous {
+		w, err := envelope.NewLocal(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev = append(prev, w)
+	}
+	return envelope.New(cur, prev...)
+}
+
+func openStore(t *testing.T, current []byte, previous ...[]byte) *Store {
+	t.Helper()
+	s, err := Open(context.Background(), testDatabaseURL(t), localEnvelope(t, current, previous...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +159,7 @@ func TestDeleteShredsCiphertext(t *testing.T) {
 	if len(sealed.Ciphertext) == 0 {
 		t.Fatal("ciphertext must survive delete; only the key dies")
 	}
-	if _, err := s.env.Open(sealed, aad("customers", id)); !errors.Is(err, envelope.ErrOpen) {
+	if _, err := s.env.Open(ctx, sealed, aad("customers", id)); !errors.Is(err, envelope.ErrOpen) {
 		t.Fatalf("shredded ciphertext opened: %v", err)
 	}
 }
@@ -335,8 +349,7 @@ func TestRotate(t *testing.T) {
 	both := openStore(t, fresh[:], old)
 	// Whatever happens below, leave the database on the shared test key.
 	t.Cleanup(func() {
-		env, _ := envelope.New(old, fresh[:])
-		back, err := Open(ctx, testDatabaseURL(t), env)
+		back, err := Open(ctx, testDatabaseURL(t), localEnvelope(t, old, fresh[:]))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -384,8 +397,7 @@ func TestRotate(t *testing.T) {
 		t.Fatalf("search with new key only: %v, %v", ids, err)
 	}
 	// And the old key alone no longer opens the store.
-	env, _ := envelope.New(old)
-	if st, err := Open(ctx, testDatabaseURL(t), env); err == nil {
+	if st, err := Open(ctx, testDatabaseURL(t), localEnvelope(t, old)); err == nil {
 		st.Close()
 		t.Fatal("old key alone must not open the store after rotation")
 	}
