@@ -1,9 +1,11 @@
 // Package store persists sealed objects in Postgres.
 //
 // Delete never removes a row. It nulls the wrapped per-object key, which makes
-// the ciphertext unrecoverable everywhere it was ever copied: replicas,
-// backups, dumps. The ciphertext itself is kept, so an erase is visible and
-// auditable rather than silently gone.
+// the ciphertext unrecoverable in this database, its replicas, and every
+// backup taken afterwards. Backups taken before still hold the wrapped key;
+// retiring the master key that wrapped it kills those too. The ciphertext
+// itself is kept, so an erase is visible and auditable rather than silently
+// gone.
 package store
 
 import (

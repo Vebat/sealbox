@@ -34,7 +34,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Database dump, stolen backup, leaked replica | Only ciphertext and wrapped DEKs are stored. Without the master key nothing opens. |
 | Insider with SQL access | Same as above. |
 | Ciphertext moved from one record to another | Every ciphertext is bound to its object id via AEAD associated data; it fails to open elsewhere. |
-| Erasure request while backups still exist | Delete destroys the wrapped DEK. All copies of the ciphertext become unrecoverable. |
+| Erasure request against the live database, replicas and later backups | Delete destroys the wrapped DEK. The ciphertext cannot be opened from this database or from any backup taken after the delete. |
 | Personal data in application logs, search indexes, analytics | The application never holds plaintext unless it explicitly reveals it. |
 | Bulk exfiltration through the reveal endpoint | `read_full` is granted per client, so most keys can only see masks. Every reveal is logged before the data is returned; batch reveal is capped at 1000 objects and logged per object. Planned: rate limits on full reveal. |
 | A reveal that leaves no trace | The audit entry is written first; if it fails, the request fails and nothing is returned. Creates and deletes commit with their entry in one transaction. |
@@ -52,6 +52,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | Compromise of the sealbox process or host | The master key is in RAM. Run it isolated, with the least privilege you can. |
 | Theft of the master key from the environment, secret store or KMS | Whoever has it has everything. Guard it like a root credential, and rotate as soon as theft is suspected. |
 | Data exposed before a rotation | Rotation re-wraps keys, it does not re-encrypt. The old key together with a dump taken while it was in use still opens those rows. |
+| A backup taken before an erasure, held with the master key that was current then | The backup carries the wrapped DEK next to the ciphertext. Rotate the master key and destroy the retired one; every backup older than that rotation is then dead for every object erased before it. Schedule rotations to match your erasure promises. |
 | An application that reveals a value and then leaks it | sealbox limits who can reveal, not what they do afterwards. |
 | Loss of the master key | Every stored value is gone. Back the key up outside the database, and test the restore. |
 | A malicious or buggy sealbox build | Verify releases. Signed builds and an SBOM are on the roadmap; a third-party audit has not happened. |

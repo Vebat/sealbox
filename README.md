@@ -11,9 +11,11 @@ PCI DSS and similar regimes audit every system that can see a card number, a pas
 Every table that holds personal data widens the blast radius of the next leak.
 
 sealbox takes personal data out of your database. Your application stores a token; sealbox stores the
-ciphertext, encrypted under a key that exists only for that one object. Deleting the object deletes its key,
-so every copy of the ciphertext in every backup and replica becomes unreadable at the same moment.
-This is crypto-shredding, and it is the only practical way to honour an erasure request when backups outlive it.
+ciphertext, encrypted under a key that exists only for that one object. Deleting the object destroys that key:
+from then on the ciphertext is unreadable in the live database, in every replica, and in every backup taken afterwards.
+This is crypto-shredding. Backups taken before the deletion still hold the object's wrapped key next to its ciphertext,
+so the last step is retiring the master key on a schedule: once the master key that was current when a backup was
+taken is destroyed, every object erased before that rotation is gone from that backup too. Rotation is built in.
 
 ## API
 
@@ -176,6 +178,14 @@ SELECT key_id, count(*) FROM objects WHERE deleted_at IS NULL GROUP BY 1;
 Rotation limits future exposure. Whoever held the old key together with a dump taken while it was in use
 can still open those rows.
 
+### Erasure and backups
+
+Rotation is also how an erasure reaches old backups. A backup holds each object's wrapped key next to its
+ciphertext, so a backup taken before a deletion, plus the master key that was current then, still opens the
+deleted object. Rotate on a schedule that matches your erasure promises, destroy the retired key everywhere it
+was kept, and every backup older than that rotation is dead for every object erased before it. Until the
+rotation happens, treat older backups as still containing the erased data.
+
 ## Audit log
 
 Every successful action is written to the `audit_log` table: which client did what, to which object, when.
@@ -219,7 +229,7 @@ must be readable by that user.
 - A dump of the database, or a stolen backup: ciphertext only, per-object keys wrapped under a master key that is never stored next to the data.
 - An insider with database access: same.
 - Personal data leaking through application logs, analytics or search indexes: the application only ever holds tokens.
-- Erasure requests against long-lived backups: crypto-shredding.
+- Erasure requests against long-lived backups: crypto-shredding, completed by master key rotation.
 
 It does **not** protect against a compromised sealbox process, a stolen master key, or an application
 that decrypts a value and leaks it itself. Read [THREAT_MODEL.md](THREAT_MODEL.md) before relying on it.

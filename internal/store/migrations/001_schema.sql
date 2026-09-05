@@ -1,7 +1,8 @@
 -- objects: every value in its own row, sealed under a per-object key that is
 -- wrapped by the master key named by key_id. Delete nulls wrapped_dek and
--- keeps the row: the ciphertext is then unrecoverable in every backup and
--- replica.
+-- keeps the row: the ciphertext is then unrecoverable here and in every
+-- backup taken afterwards. Earlier backups still carry the wrapped key until
+-- the master key of that time is retired.
 CREATE TABLE objects (
 	id          text        PRIMARY KEY,
 	collection  text        NOT NULL,

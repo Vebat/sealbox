@@ -136,7 +136,7 @@
       },
       "delete": {
         "operationId": "deleteObject",
-        "summary": "Crypto-shred: destroy the object's key. Its ciphertext can never be opened again, in any backup or replica. Role: delete.",
+        "summary": "Crypto-shred: destroy the object's key. Its ciphertext can never be opened again from this database or from backups taken afterwards; backups taken before are dead once the master key of that time is retired. Role: delete.",
         "parameters": [
           { "$ref": "#/components/parameters/collection" },
           { "$ref": "#/components/parameters/id" }
