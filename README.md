@@ -356,12 +356,29 @@ SEALBOX_MASTER_KEY=$(openssl rand -base64 32) SEALBOX_API_KEY=$(openssl rand -ba
 SEALBOX_DATABASE_URL=postgres://user:pass@localhost:5432/sealbox SEALBOX_ADDR=127.0.0.1:8080 go run ./cmd/sealbox
 ```
 
+## Releases
+
+Every `v*` tag builds binaries for linux, windows and macOS, an SPDX SBOM, and signs each file with cosign
+under this repository's GitHub identity, keyless. Verify a download before running it:
+
+```sh
+cosign verify-blob --bundle sealbox_v0.2.0_linux_amd64.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/Vebat/sealbox/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  sealbox_v0.2.0_linux_amd64
+```
+
+The release notes are the tag's annotation.
+
 ## Open
 
 Not built yet, in the order they are likely to matter:
 
-- Signed releases and an SBOM
 - A third-party audit
+- A DEK cache and transit `batch_input`, so a batch reveal through a key service is not one call per object
+- Partial indexes on declared fragments, such as the last four digits of a card
+- A Helm chart
+- Client wrappers for ORMs, and a proxy mode that keeps card numbers out of the application entirely
 
 ## Done
 
@@ -383,6 +400,7 @@ Not built yet, in the order they are likely to matter:
 - [x] `sealbox reindex`: rebuild the blind index for existing objects under a changed schema
 - [x] Prometheus metrics on a separate address
 - [x] Search pagination with an `after` cursor
+- [x] Signed releases with an SBOM on every tag
 
 ## Design rules
 

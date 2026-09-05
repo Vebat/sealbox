@@ -57,7 +57,7 @@ If a claim in the README is not backed by a line here, the README is wrong.
 | A backup taken before an erasure, held with the master key that was current then | The backup carries the wrapped DEK next to the ciphertext. Rotate the master key and destroy the retired one; every backup older than that rotation is then dead for every object erased before it. Schedule rotations to match your erasure promises. |
 | An application that reveals a value and then leaks it | sealbox limits who can reveal, not what they do afterwards. |
 | Loss of the master key | Every stored value is gone. Back the key up outside the database, and test the restore. |
-| A malicious or buggy sealbox build | Verify releases. Signed builds and an SBOM are on the roadmap; a third-party audit has not happened. |
+| A malicious or buggy sealbox build | Releases are signed with cosign under the repository's GitHub identity and ship an SBOM; verify before running. A third-party audit has not happened. |
 | Traffic analysis | Object sizes and access patterns are visible to the database and the network. |
 | Equality leaking through the blind index | A dump shows which records share an indexed value, not what it is. Hashes are separated per collection and field, so the same value in two fields does not link them. Index only what you must search. |
 | Membership probing through search | Search confirms whether a value you already hold exists. It needs the `search` role, is logged, and spends the client's reveal budget, so probing a list of phone numbers runs at the budget's pace and shows in the log. |
