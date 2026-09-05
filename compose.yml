@@ -1,0 +1,21 @@
+# Local development only. Credentials below are throwaway.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sealbox
+      POSTGRES_PASSWORD: sealbox
+      POSTGRES_DB: sealbox
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  sealbox:
+    build: .
+    environment:
+      SEALBOX_MASTER_KEY: ${SEALBOX_MASTER_KEY:?set it in .env, see .env.example}
+      SEALBOX_DATABASE_URL: postgres://sealbox:sealbox@postgres:5432/sealbox?sslmode=disable
+    ports: ["8080:8080"]
+    depends_on: [postgres]
+
+volumes:
+  pgdata:
