@@ -376,12 +376,12 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for field, value := range query {
-		normalized, err := s.schema.Normalize(collection, field, value)
+		index, normalized, err := s.schema.Normalize(collection, field, value)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		ids, err := s.vault.Search(r.Context(), collection, field, normalized, after)
+		ids, err := s.vault.Search(r.Context(), collection, index, normalized, after)
 		if err != nil {
 			internalError(w, "search", err)
 			return
@@ -389,7 +389,7 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 		if ids == nil {
 			ids = []string{}
 		}
-		if !s.audit(w, r, "search", collection, "", field) {
+		if !s.audit(w, r, "search", collection, "", index) {
 			return
 		}
 		res := map[string]any{"ids": ids}

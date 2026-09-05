@@ -136,7 +136,7 @@ A schema file, passed as `SEALBOX_SCHEMA`, declares what each collection holds. 
 { "customers": { "fields": {
     "email":    { "type": "email", "index": true },
     "phone":    { "type": "phone", "index": true },
-    "card":     { "type": "card" },
+    "card":     { "type": "card", "fragments": ["last4"] },
     "passport": { "type": "string" }
 } } }
 ```
@@ -157,6 +157,9 @@ Rules:
 - `index: true` makes a field searchable. sealbox stores an HMAC-SHA256 of the normalized value, never the value, under a random
   index key that is created on first start and kept in the `keys` table wrapped by the master key. Back that table up with the rest.
   A database dump shows which records share a value, not what it is, and cannot be used to test guesses without the master key.
+- `fragments: ["last4"]` on a phone or card field indexes its last four digits on their own, the way a support desk asks
+  "the card ending in 1111". A search value of exactly four digits on such a field searches the fragment. It is the only
+  partial search there is: a fragment must be declared, so what leaks by equality is a decision in the schema, not an accident.
 - Validation errors name the field, never the submitted value.
 - The schema is read at startup. Change the file, restart the process. Adding `index` to a field indexes new objects
   from then on; run `sealbox reindex [collection]` with the same schema to rebuild the index for existing ones.
@@ -376,7 +379,6 @@ The release notes are the tag's annotation.
 Not built yet, in the order they are likely to matter:
 
 - A third-party audit
-- Partial indexes on declared fragments, such as the last four digits of a card
 - A Helm chart
 - Client wrappers for ORMs, and a proxy mode that keeps card numbers out of the application entirely
 
@@ -402,6 +404,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Search pagination with an `after` cursor
 - [x] Signed releases with an SBOM on every tag
 - [x] Batch reads through a key service unwrap 500 keys per round trip
+- [x] Fragment indexes: search a card or phone by its last four digits
 
 ## Design rules
 

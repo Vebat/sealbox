@@ -138,7 +138,7 @@ var testClients = []Client{
 
 const testSchema = `{"customers": {"fields": {
 	"email":    {"type": "email", "index": true},
-	"card":     {"type": "card"},
+	"card":     {"type": "card", "fragments": ["last4"]},
 	"passport": {"type": "string"}
 }}}`
 
@@ -365,16 +365,26 @@ func TestSearch(t *testing.T) {
 		t.Errorf("bad cursor: %d", status)
 	}
 
+	// A card is searchable by its last four digits only; the whole number is not indexed.
+	c := idOf(create(t, srv, "customers", `{"card":"4111 1111 1111 1111"}`))
+	if _, body := do(t, srv, "POST", path, `{"card":"1111"}`, supportKey); body != `{"ids":["`+c+`"]}` {
+		t.Errorf("last four: %s", body)
+	}
+	if status, body := do(t, srv, "POST", path, `{"card":"4111 1111 1111 1111"}`, supportKey); status != http.StatusBadRequest || strings.Contains(body, "4111") {
+		t.Errorf("whole card: %d %s", status, body)
+	}
+
 	for name, tc := range map[string]struct {
 		path, body string
 		want       int
 	}{
-		"not indexed":           {path, `{"passport":"4510 123456"}`, http.StatusBadRequest},
-		"unknown field":         {path, `{"ssn":"123"}`, http.StatusBadRequest},
-		"two fields":            {path, `{"email":"a@b","passport":"x"}`, http.StatusBadRequest},
-		"non-string value":      {path, `{"email":5}`, http.StatusBadRequest},
-		"not an object":         {path, `["email"]`, http.StatusBadRequest},
-		"undeclared collection": {"/v1/collections/logs/search", `{"email":"a@b"}`, http.StatusBadRequest},
+		"not indexed":                     {path, `{"passport":"4510 123456"}`, http.StatusBadRequest},
+		"fragment on a field without one": {path, `{"email":"1234"}`, http.StatusOK},
+		"unknown field":                   {path, `{"ssn":"123"}`, http.StatusBadRequest},
+		"two fields":                      {path, `{"email":"a@b","passport":"x"}`, http.StatusBadRequest},
+		"non-string value":                {path, `{"email":5}`, http.StatusBadRequest},
+		"not an object":                   {path, `["email"]`, http.StatusBadRequest},
+		"undeclared collection":           {"/v1/collections/logs/search", `{"email":"a@b"}`, http.StatusBadRequest},
 	} {
 		status, body := do(t, srv, "POST", tc.path, tc.body, supportKey)
 		if status != tc.want {

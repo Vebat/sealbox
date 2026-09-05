@@ -3,7 +3,7 @@
     "fields": {
       "email":    { "type": "email", "index": true },
       "phone":    { "type": "phone", "index": true },
-      "card":     { "type": "card" },
+      "card":     { "type": "card", "fragments": ["last4"] },
       "passport": { "type": "string" }
     }
   }

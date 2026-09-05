@@ -182,7 +182,7 @@
     "/v1/collections/{collection}/search": {
       "post": {
         "operationId": "searchObjects",
-        "summary": "Find objects whose indexed field equals the value after normalization. Exactly one field. Exact match only, 100 per page. Role: search.",
+        "summary": "Find objects whose indexed field equals the value after normalization, or, with exactly four digits on a field declaring the last4 fragment, whose value ends in them. Exactly one field. 100 per page. Role: search.",
         "parameters": [
           { "$ref": "#/components/parameters/collection" },
           { "name": "after", "in": "query", "schema": { "$ref": "#/components/schemas/ID" }, "description": "Return ids after this one: the next value of the previous page." }
