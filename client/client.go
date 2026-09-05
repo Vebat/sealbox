@@ -92,14 +92,26 @@ func (c *Client) Delete(ctx context.Context, collection, id string) error {
 	return c.do(ctx, "DELETE", collectionPath(collection)+"/objects/"+url.PathEscape(id), nil, nil)
 }
 
-// Search returns the ids of objects whose indexed field equals value after
-// normalization, at most 100. Role: search.
+// Search returns the first page of ids of objects whose indexed field equals
+// value after normalization, at most 100. Role: search.
 func (c *Client) Search(ctx context.Context, collection, field, value string) ([]string, error) {
+	ids, _, err := c.SearchAfter(ctx, collection, field, value, "")
+	return ids, err
+}
+
+// SearchAfter returns the page of matching ids after the given id, and the
+// cursor for the next page, empty on the last one. Role: search.
+func (c *Client) SearchAfter(ctx context.Context, collection, field, value, after string) (ids []string, next string, err error) {
 	var res struct {
-		IDs []string `json:"ids"`
+		IDs  []string `json:"ids"`
+		Next string   `json:"next"`
 	}
-	err := c.do(ctx, "POST", collectionPath(collection)+"/search", map[string]string{field: value}, &res)
-	return res.IDs, err
+	path := collectionPath(collection) + "/search"
+	if after != "" {
+		path += "?after=" + url.QueryEscape(after)
+	}
+	err = c.do(ctx, "POST", path, map[string]string{field: value}, &res)
+	return res.IDs, res.Next, err
 }
 
 // Ref names one object: its collection and id.

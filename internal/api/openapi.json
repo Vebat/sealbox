@@ -182,8 +182,11 @@
     "/v1/collections/{collection}/search": {
       "post": {
         "operationId": "searchObjects",
-        "summary": "Find objects whose indexed field equals the value after normalization. Exactly one field. Exact match only. Role: search.",
-        "parameters": [{ "$ref": "#/components/parameters/collection" }],
+        "summary": "Find objects whose indexed field equals the value after normalization. Exactly one field. Exact match only, 100 per page. Role: search.",
+        "parameters": [
+          { "$ref": "#/components/parameters/collection" },
+          { "name": "after", "in": "query", "schema": { "$ref": "#/components/schemas/ID" }, "description": "Return ids after this one: the next value of the previous page." }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -200,8 +203,8 @@
         },
         "responses": {
           "200": {
-            "description": "Ids of matching live objects, at most 100.",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IDs" } } }
+            "description": "Ids of matching live objects in id order, at most 100. A full page carries next, the cursor for the following page.",
+            "content": { "application/json": { "schema": { "type": "object", "required": ["ids"], "properties": { "ids": { "type": "array", "items": { "$ref": "#/components/schemas/ID" } }, "next": { "$ref": "#/components/schemas/ID" } } } } }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },

@@ -58,7 +58,7 @@ type Vault interface {
 	PutMany(ctx context.Context, actor, collection string, items []store.Item) ([]string, error)
 	GetMany(ctx context.Context, collection string, ids []string) (map[string][]byte, error)
 	Delete(ctx context.Context, actor, collection, id string) error
-	Search(ctx context.Context, collection, field, normalized string) ([]string, error)
+	Search(ctx context.Context, collection, field, normalized, after string) ([]string, error)
 	Subject(ctx context.Context, subject string) ([]store.Ref, error)
 	DeleteSubject(ctx context.Context, actor, subject string) ([]store.Ref, error)
 	AuditMany(ctx context.Context, entries []store.AuditEntry) error
@@ -353,12 +353,19 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 }
 
 // search answers {"ids": [...]} for a body of exactly one indexed field and
-// its value. It confirms whether a known value exists, so it has its own role.
+// its value. It confirms whether a known value exists, so it has its own
+// role. A full page comes with "next", the id to pass as ?after= for the
+// following one.
 func (s *server) search(w http.ResponseWriter, r *http.Request) {
 	if !require(w, r, RoleSearch) || !s.allow(w, r, 1) {
 		return
 	}
 	collection := r.PathValue("collection")
+	after := r.URL.Query().Get("after")
+	if after != "" && !idRe.MatchString(after) {
+		writeError(w, http.StatusBadRequest, "after must be an object id")
+		return
+	}
 	body, ok := readBody(w, r, maxQuery)
 	if !ok {
 		return
@@ -374,7 +381,7 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		ids, err := s.vault.Search(r.Context(), collection, field, normalized)
+		ids, err := s.vault.Search(r.Context(), collection, field, normalized, after)
 		if err != nil {
 			internalError(w, "search", err)
 			return
@@ -385,7 +392,11 @@ func (s *server) search(w http.ResponseWriter, r *http.Request) {
 		if !s.audit(w, r, "search", collection, "", field) {
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string][]string{"ids": ids})
+		res := map[string]any{"ids": ids}
+		if len(ids) == store.SearchPage {
+			res["next"] = ids[len(ids)-1]
+		}
+		writeJSON(w, http.StatusOK, res)
 	}
 }
 

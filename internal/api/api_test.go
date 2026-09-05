@@ -106,12 +106,16 @@ func (f *fakeVault) Delete(_ context.Context, actor, collection, id string) erro
 	return nil
 }
 
-func (f *fakeVault) Search(_ context.Context, collection, field, normalized string) ([]string, error) {
+func (f *fakeVault) Search(_ context.Context, collection, field, normalized, after string) ([]string, error) {
 	var ids []string
 	for k, idx := range f.indexed {
-		if c, id, _ := strings.Cut(k, "/"); c == collection && idx[field] == normalized {
+		if c, id, _ := strings.Cut(k, "/"); c == collection && idx[field] == normalized && id > after {
 			ids = append(ids, id)
 		}
+	}
+	slices.Sort(ids)
+	if len(ids) > store.SearchPage {
+		ids = ids[:store.SearchPage]
 	}
 	return ids, nil
 }
@@ -357,6 +361,9 @@ func TestSearch(t *testing.T) {
 	if _, body := do(t, srv, "POST", path, `{"email":"nobody@example.com"}`, supportKey); body != `{"ids":[]}` {
 		t.Errorf("no match: got %s", body)
 	}
+	if status, _ := do(t, srv, "POST", path+"?after=nope", `{"email":"a@b"}`, supportKey); status != http.StatusBadRequest {
+		t.Errorf("bad cursor: %d", status)
+	}
 
 	for name, tc := range map[string]struct {
 		path, body string
@@ -376,6 +383,34 @@ func TestSearch(t *testing.T) {
 		if strings.Contains(body, "4510") || strings.Contains(body, "123") {
 			t.Errorf("%s: response echoes submitted data: %s", name, body)
 		}
+	}
+}
+
+func TestSearchPagination(t *testing.T) {
+	srv, vault := newServerWithVault(t)
+	items := make([]store.Item, store.SearchPage+3)
+	for i := range items {
+		items[i] = store.Item{Plaintext: []byte(`{"email":"same@example.com"}`), Indexed: map[string]string{"email": "same@example.com"}}
+	}
+	if _, err := vault.PutMany(context.Background(), "test", "customers", items); err != nil {
+		t.Fatal(err)
+	}
+	const path = "/v1/collections/customers/search"
+	var page struct {
+		IDs  []string `json:"ids"`
+		Next string   `json:"next"`
+	}
+	_, body := do(t, srv, "POST", path, `{"email":"same@example.com"}`, adminKey)
+	json.Unmarshal([]byte(body), &page)
+	if len(page.IDs) != store.SearchPage || page.Next != page.IDs[len(page.IDs)-1] {
+		t.Fatalf("first page: %d ids, next %q", len(page.IDs), page.Next)
+	}
+	first := slices.Clone(page.IDs)
+	_, body = do(t, srv, "POST", path+"?after="+page.Next, `{"email":"same@example.com"}`, adminKey)
+	page.IDs, page.Next = nil, ""
+	json.Unmarshal([]byte(body), &page)
+	if len(page.IDs) != 3 || page.Next != "" || slices.Contains(first, page.IDs[0]) {
+		t.Fatalf("second page: %d ids, next %q", len(page.IDs), page.Next)
 	}
 }
 

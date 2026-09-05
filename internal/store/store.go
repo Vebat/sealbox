@@ -280,14 +280,19 @@ func (s *Store) GetMany(ctx context.Context, collection string, ids []string) (m
 	return found, rows.Err()
 }
 
+// SearchPage is how many ids one Search returns at most.
+const SearchPage = 100
+
 // Search returns the ids of live objects whose indexed field equals the
-// normalized value, at most 100. Only the keyed hash reaches the database.
-func (s *Store) Search(ctx context.Context, collection, field, normalized string) ([]string, error) {
+// normalized value, in id order, at most SearchPage of them, and only those
+// after the given id when after is not empty. Only the keyed hash reaches
+// the database.
+func (s *Store) Search(ctx context.Context, collection, field, normalized, after string) ([]string, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT object_id FROM blind_index
-		 WHERE collection = $1 AND field = $2 AND hash = $3
-		 ORDER BY object_id LIMIT 100`,
-		collection, field, s.index.Hash(collection, field, normalized))
+		 WHERE collection = $1 AND field = $2 AND hash = $3 AND object_id > $4
+		 ORDER BY object_id LIMIT $5`,
+		collection, field, s.index.Hash(collection, field, normalized), after, SearchPage)
 	if err != nil {
 		return nil, err
 	}

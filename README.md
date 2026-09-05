@@ -63,7 +63,8 @@ POST /v1/collections/customers/search
 -> 200 { "ids": ["tok_9f3a..."] }
 ```
 
-Search takes exactly one indexed field and finds objects whose value is equal after normalization, at most 100 of them.
+Search takes exactly one indexed field and finds objects whose value is equal after normalization, 100 per page;
+a full page carries `next`, the id to pass as `?after=` for the following one.
 It is exact match only: you can find a record by a value you already know in full, you cannot browse.
 Ranges, prefixes and free text belong in your own database, on fields that are not personal data.
 
@@ -381,6 +382,7 @@ Not built yet, in the order they are likely to matter:
 - [x] Hardening: audit entries to stdout for shipping, no core dumps on Linux, client certificates for the API
 - [x] `sealbox reindex`: rebuild the blind index for existing objects under a changed schema
 - [x] Prometheus metrics on a separate address
+- [x] Search pagination with an `after` cursor
 
 ## Design rules
 

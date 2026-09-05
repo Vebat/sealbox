@@ -245,7 +245,7 @@ func TestSearch(t *testing.T) {
 
 	search := func(collection, field, value string) []string {
 		t.Helper()
-		ids, err := s.Search(ctx, collection, field, value)
+		ids, err := s.Search(ctx, collection, field, value, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,7 +290,7 @@ func TestIndexKeySurvivesRestart(t *testing.T) {
 	first := newStore(t)
 	id := mustPut(t, first, "customers", `{}`, map[string]string{"email": email})
 	second := newStore(t)
-	if ids, err := second.Search(ctx, "customers", "email", email); err != nil || !slices.Equal(ids, []string{id}) {
+	if ids, err := second.Search(ctx, "customers", "email", email, ""); err != nil || !slices.Equal(ids, []string{id}) {
 		t.Fatalf("search from a second store: %v, %v", ids, err)
 	}
 }
@@ -320,7 +320,7 @@ func TestPutManyGetMany(t *testing.T) {
 	if found, _ := s.GetMany(ctx, "employees", ids); len(found) != 0 {
 		t.Fatalf("other collection: %v", found)
 	}
-	if hits, err := s.Search(ctx, "customers", "email", email); err != nil || !slices.Equal(hits, []string{ids[1]}) {
+	if hits, err := s.Search(ctx, "customers", "email", email, ""); err != nil || !slices.Equal(hits, []string{ids[1]}) {
 		t.Fatalf("search after batch: %v, %v", hits, err)
 	}
 	for _, id := range ids {
@@ -399,7 +399,7 @@ func TestRotate(t *testing.T) {
 	if got, err := get(only, "customers", id); err != nil || string(got) != `{"n":"1"}` {
 		t.Fatalf("get with new key only: %q, %v", got, err)
 	}
-	if ids, err := only.Search(ctx, "customers", "email", email); err != nil || !slices.Equal(ids, []string{id}) {
+	if ids, err := only.Search(ctx, "customers", "email", email, ""); err != nil || !slices.Equal(ids, []string{id}) {
 		t.Fatalf("search with new key only: %v, %v", ids, err)
 	}
 	// And the old key alone no longer opens the store.
@@ -541,7 +541,7 @@ func TestSubject(t *testing.T) {
 			t.Errorf("%s/%s: audit %v", r.Collection, r.ID, got)
 		}
 	}
-	if hits, _ := s.Search(ctx, "customers", "email", email); len(hits) != 0 {
+	if hits, _ := s.Search(ctx, "customers", "email", email, ""); len(hits) != 0 {
 		t.Errorf("index entries must go with the objects: %v", hits)
 	}
 	if _, err := get(s, "customers", other); err != nil {
@@ -593,7 +593,7 @@ func TestRuntimeRole(t *testing.T) {
 	if got, err := get(runtime, "customers", id); err != nil || string(got) != `{"n":"1"}` {
 		t.Fatalf("get: %q, %v", got, err)
 	}
-	if hits, err := runtime.Search(ctx, "customers", "email", email); err != nil || !slices.Equal(hits, []string{id}) {
+	if hits, err := runtime.Search(ctx, "customers", "email", email, ""); err != nil || !slices.Equal(hits, []string{id}) {
 		t.Fatalf("search: %v, %v", hits, err)
 	}
 	if _, _, err := runtime.Rotate(ctx); err != nil {
@@ -667,13 +667,13 @@ func TestReindex(t *testing.T) {
 	if err != nil || done < 1 {
 		t.Fatalf("reindex: done=%d err=%v", done, err)
 	}
-	if hits, _ := s.Search(ctx, "customers", "phone", phone); !slices.Equal(hits, []string{id}) {
+	if hits, _ := s.Search(ctx, "customers", "phone", phone, ""); !slices.Equal(hits, []string{id}) {
 		t.Fatalf("phone now searchable: %v", hits)
 	}
-	if hits, _ := s.Search(ctx, "customers", "email", email); !slices.Equal(hits, []string{id}) {
+	if hits, _ := s.Search(ctx, "customers", "email", email, ""); !slices.Equal(hits, []string{id}) {
 		t.Fatalf("email still searchable: %v", hits)
 	}
-	if hits, _ := s.Search(ctx, "staff", "phone", phone); len(hits) != 0 {
+	if hits, _ := s.Search(ctx, "staff", "phone", phone, ""); len(hits) != 0 {
 		t.Fatalf("other collection untouched by a scoped reindex: %v", hits)
 	}
 	if got := auditActions(t, s, id); got[len(got)-1] != "reindex" {
@@ -687,7 +687,7 @@ func TestReindex(t *testing.T) {
 	if _, _, err := s.Reindex(ctx, actor, "", indexed); err != nil {
 		t.Fatal(err)
 	}
-	if hits, _ := s.Search(ctx, "staff", "phone", phone); !slices.Equal(hits, []string{other}) {
+	if hits, _ := s.Search(ctx, "staff", "phone", phone, ""); !slices.Equal(hits, []string{other}) {
 		t.Fatalf("staff phone after full reindex: %v", hits)
 	}
 }
